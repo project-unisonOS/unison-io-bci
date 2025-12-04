@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
+from fastapi import status
 import uvicorn
 
 from .auth import AuthValidator
@@ -19,6 +20,7 @@ from .drivers.ble import BLEIngestor
 from .drivers.serial import SerialIngestor
 from .drivers.registry import get_profile
 from .hid import HIDEmitter
+from .middleware import ScopeMiddleware
 
 try:
     from pylsl import StreamInlet, resolve_byprop  # type: ignore
@@ -59,6 +61,7 @@ logger = configure_logging(APP_NAME) if "configure_logging" in globals() else lo
 app = FastAPI(title=APP_NAME)
 if BatonMiddleware:
     app.add_middleware(BatonMiddleware)
+app.add_middleware(ScopeMiddleware, auth=_auth)
 
 _metrics = defaultdict(int)
 _start_time = time.time()
