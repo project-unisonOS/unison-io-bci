@@ -13,6 +13,12 @@ import httpx
 from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 import uvicorn
 
+from .auth import AuthValidator
+from .decoders import WindowedDecoder, RMSDecoder
+from .drivers.ble import BLEIngestor
+from .drivers.serial import SerialIngestor
+from .hid import HIDEmitter
+
 try:
     from pylsl import StreamInlet, resolve_byprop  # type: ignore
     _PYLSL_AVAILABLE = True
@@ -39,6 +45,10 @@ WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
 REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
+AUTH_JWKS_URL = os.getenv("UNISON_BCI_AUTH_JWKS_URL", "")
+AUTH_AUDIENCE = os.getenv("UNISON_BCI_AUTH_AUDIENCE", "")
+AUTH_ISSUER = os.getenv("UNISON_BCI_AUTH_ISSUER", "")
+CONSENT_INTROSPECT_URL = os.getenv("UNISON_BCI_CONSENT_INTROSPECT_URL", "")
 
 logger = configure_logging(APP_NAME) if "configure_logging" in globals() else logging.getLogger(APP_NAME)
 app = FastAPI(title=APP_NAME)
@@ -48,6 +58,15 @@ if BatonMiddleware:
 _metrics = defaultdict(int)
 _start_time = time.time()
 _hid_mappings: Dict[str, str] = {}
+_hid = HIDEmitter()
+_auth = AuthValidator(
+    jwks_url=AUTH_JWKS_URL or None,
+    audience=AUTH_AUDIENCE or None,
+    issuer=AUTH_ISSUER or None,
+    consent_introspect_url=CONSENT_INTROSPECT_URL or None,
+)
+_ble_ingestor: Optional[BLEIngestor] = None
+_serial_ingestor: Optional[SerialIngestor] = None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -127,23 +146,19 @@ broadcaster = IntentBroadcaster()
 _lsl_ingestor = None
 
 
-def _has_scope(request: Request, required: str) -> bool:
-    # Accept scopes in X-Auth-Scopes (comma-separated) or Authorization: Bearer scopes=...
-    scopes_raw = request.headers.get("X-Auth-Scopes") or request.headers.get("X-Scopes")
-    scopes: Set[str] = set()
-    if scopes_raw:
-        scopes = {s.strip() for s in scopes_raw.split(",") if s.strip()}
-    auth = request.headers.get("Authorization") or ""
-    if "scopes=" in auth:
-        for part in auth.split():
-            if part.startswith("scopes="):
-                scopes.update({s.strip() for s in part.split("=", 1)[1].split(",") if s.strip()})
-    return required in scopes or "*" in scopes
-
-
-def _require_scope(request: Request, required: str):
-    if not _has_scope(request, required):
+def _require_scope_request(request: Request, required: str | None):
+    if not required:
+        return
+    token = _auth.extract_token(request.headers.get("Authorization"))
+    if not token or not _auth.authorize(token, required):
         raise HTTPException(status_code=403, detail=f"missing required scope: {required}")
+
+
+def _require_scope_ws(ws: WebSocket, required: str | None) -> bool:
+    if not required:
+        return True
+    token = _auth.extract_token(ws.headers.get("Authorization"), ws.query_params.get("token"))
+    return bool(token and _auth.authorize(token, required))
 
 
 def _caps_payload() -> Dict[str, Any]:
@@ -206,6 +221,7 @@ async def _emit_bci_intent_event(intent_event: Dict[str, Any]) -> None:
 def _emit_hid_mapping_if_any(intent_event: Dict[str, Any]) -> None:
     cmd = (intent_event.get("intent") or {}).get("command")
     if cmd and cmd in _hid_mappings:
+        _hid.send(_hid_mappings[cmd])
         hid_event = {
             "schema_version": "2.0",
             "id": str(uuid.uuid4()),
@@ -227,7 +243,8 @@ class LSLIngestor:
         self._emit_cb = emit_cb
         self._stop = threading.Event()
         self._last_emit: Dict[str, float] = {}
-        self._windows: Dict[str, List[float]] = defaultdict(list)
+        self._window_decoder = WindowedDecoder(WINDOW_SAMPLES, AMPLITUDE_THRESHOLD)
+        self._rms_decoder = RMSDecoder(WINDOW_SAMPLES, AMPLITUDE_THRESHOLD)
 
     def start(self) -> None:
         t = threading.Thread(target=self._run, daemon=True, name="bci-lsl-ingest")
@@ -268,22 +285,16 @@ class LSLIngestor:
                         if not chunk:
                             time.sleep(0.05)
                             continue
-                        # Windowed decoder: average absolute amplitude across channels per sample, then over window
-                        for sample in chunk:
-                            magnitude = sum(abs(x) for x in sample) / max(len(sample), 1)
-                            window = self._windows[stream_id]
-                            window.append(magnitude)
-                            if len(window) > WINDOW_SAMPLES:
-                                window.pop(0)
-                            if len(window) < WINDOW_SAMPLES:
-                                continue
-                            avg_mag = sum(window) / max(len(window), 1)
-                            if self._should_emit(stream_id, avg_mag):
-                                confidence = min(1.0, avg_mag / max(AMPLITUDE_THRESHOLD, 1e-3))
-                                intent_event = _build_bci_intent("click", confidence=confidence)
-                                intent_event["metadata"]["source_stream"] = stream_id
-                                intent_event["intent"]["latency_ms"] = 0
-                                asyncio.run(self._emit_cb(intent_event))
+                        avg_mag, passed_mag = self._window_decoder.add_samples(stream_id, chunk)
+                        avg_rms, passed_rms = self._rms_decoder.add_samples(stream_id, chunk)
+                        passed = passed_mag or passed_rms
+                        confidence_src = max(avg_mag, avg_rms)
+                        if passed and self._should_emit(stream_id, confidence_src):
+                            confidence = min(1.0, confidence_src / max(AMPLITUDE_THRESHOLD, 1e-3))
+                            intent_event = _build_bci_intent("click", confidence=confidence)
+                            intent_event["metadata"]["source_stream"] = stream_id
+                            intent_event["intent"]["latency_ms"] = 0
+                            asyncio.run(self._emit_cb(intent_event))
                 except Exception as exc:  # pragma: no cover
                     logger.warning("lsl_ingest_error %s", exc)
                     time.sleep(1)
@@ -318,6 +329,29 @@ def _start_lsl_ingest():
     _lsl_ingestor.start()
 
 
+def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
+    devices.attach(device_id, kind, meta)
+    log_json(logging.INFO, "device_detected", service=APP_NAME, device_id=device_id, kind=kind)
+
+
+def _start_ble_ingest():
+    global _ble_ingestor
+    _ble_ingestor = BLEIngestor(_on_device_detect)
+
+    async def _runner():
+        await _ble_ingestor.scan()
+
+    t = threading.Thread(target=lambda: asyncio.run(_runner()), daemon=True, name="bci-ble-scan")
+    t.start()
+
+
+def _start_serial_probe():
+    global _serial_ingestor
+    _serial_ingestor = SerialIngestor(_on_device_detect)
+    t = threading.Thread(target=_serial_ingestor.probe, daemon=True, name="bci-serial-probe")
+    t.start()
+
+
 @app.on_event("startup")
 def _on_startup():
     try:
@@ -326,6 +360,8 @@ def _on_startup():
         logger.warning("caps_report_failed %s", exc)
     _start_demo_if_enabled()
     _start_lsl_ingest()
+    _start_ble_ingest()
+    _start_serial_probe()
 
 
 @app.get("/healthz")
@@ -342,7 +378,7 @@ def health(request: Request):
 def ready(request: Request):
     _metrics["/ready"] += 1
     event_id = request.headers.get("X-Event-ID")
-    _require_scope(request, REQUIRED_SCOPE_INTENTS) if REQUIRED_SCOPE_INTENTS else None
+    _require_scope_request(request, REQUIRED_SCOPE_INTENTS)
     ok, _, _ = http_post_json(ORCH_HOST, ORCH_PORT, "/health", {}, headers={"X-Event-ID": event_id})
     log_json(logging.INFO, "ready", service=APP_NAME, event_id=event_id, orchestrator_ok=ok)
     return {"ready": ok, "orchestrator": {"host": ORCH_HOST, "port": ORCH_PORT, "ok": ok}}
@@ -388,7 +424,7 @@ def list_devices():
 @app.post("/bci/hid-map")
 def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
     _metrics["/bci/hid-map"] += 1
-    _require_scope(request, REQUIRED_SCOPE_HID) if REQUIRED_SCOPE_HID else None
+    _require_scope_request(request, REQUIRED_SCOPE_HID)
     # Stub: store mapping in memory for now
     mappings = payload.get("mappings")
     if not isinstance(mappings, dict):
@@ -401,8 +437,7 @@ def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
 
 @app.websocket("/bci/intents")
 async def websocket_intents(ws: WebSocket):
-    scopes_raw = ws.headers.get("X-Auth-Scopes") or ws.headers.get("X-Scopes") or ""
-    if REQUIRED_SCOPE_INTENTS and REQUIRED_SCOPE_INTENTS not in scopes_raw and "*" not in scopes_raw:
+    if not _require_scope_ws(ws, REQUIRED_SCOPE_INTENTS):
         await ws.close(code=4403)
         return
     await broadcaster.register(ws)
@@ -420,8 +455,7 @@ async def websocket_intents(ws: WebSocket):
 
 @app.websocket("/bci/raw")
 async def websocket_raw(ws: WebSocket):
-    scopes_raw = ws.headers.get("X-Auth-Scopes") or ws.headers.get("X-Scopes") or ""
-    if REQUIRED_SCOPE_RAW and REQUIRED_SCOPE_RAW not in scopes_raw and "*" not in scopes_raw:
+    if not _require_scope_ws(ws, REQUIRED_SCOPE_RAW):
         await ws.close(code=4403)
         return
     await ws.accept()

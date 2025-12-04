@@ -20,6 +20,8 @@ Phase 1 MVP scaffold — joins devstack alongside other `unison-io-*` services.
 - `WS /bci/raw` — diagnostics/raw mirror (stubbed for now; requires `bci.raw.read`).
 - `POST /bci/hid-map` — configure BCI→virtual HID mappings (requires `bci.hid.map`).
 - Best-effort `caps.report` emission on startup (`bci_adapter: {present: true}`).
+- Best-effort BLE scan and serial probe to detect known EEG devices; LSL ingest for EEG streams.
+- Optional virtual HID output using `evdev/uinput` when available; otherwise logs.
 
 ## Running locally
 ```bash
@@ -39,6 +41,8 @@ Environment:
 - `UNISON_BCI_INTENT_COOLDOWN_SEC` — cooldown between decoded intents per stream.
 - `UNISON_BCI_WINDOW_SAMPLES` — window size for amplitude averaging before decoding.
 - `UNISON_BCI_SCOPE_INTENTS` / `UNISON_BCI_SCOPE_RAW` / `UNISON_BCI_SCOPE_HID` — required scopes checked on WS/endpoints.
+- `UNISON_BCI_AUTH_JWKS_URL`, `UNISON_BCI_AUTH_AUDIENCE`, `UNISON_BCI_AUTH_ISSUER` — JWT validation for scopes (recommended).
+- `UNISON_BCI_CONSENT_INTROSPECT_URL` — optional consent introspection endpoint (e.g., consent `/introspect`).
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.
@@ -46,6 +50,6 @@ Environment:
 - `tests/` — unit/integration tests (TODO).
 
 ## Next steps
-- Extend decoder plugins (SSVEP/SMR), add BLE/USB drivers, and expose raw stream mirroring.
-- Harden auth/consent enforcement with JWT/consent validation (current headers-based scopes are a stopgap).
-- Integrate real HID virtual device support (evdev/uinput) and export/calibration endpoints.
+- Extend decoder plugins (SSVEP/SMR) and expose raw stream mirroring.
+- Harden auth/consent enforcement with JWT/consent validation (now supported via JWKS + consent introspection).
+- Integrate full HID virtual device support (evdev/uinput path is available where permitted) and export/calibration endpoints.
