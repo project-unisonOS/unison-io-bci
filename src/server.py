@@ -43,6 +43,7 @@ AMPLITUDE_THRESHOLD = float(os.getenv("UNISON_BCI_AMPLITUDE_THRESHOLD", "75.0"))
 INTENT_COOLDOWN_SEC = float(os.getenv("UNISON_BCI_INTENT_COOLDOWN_SEC", "3.0"))
 WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
 MAX_BUFFER_SAMPLES = int(os.getenv("UNISON_BCI_MAX_BUFFER_SAMPLES", "5000"))
+DEFAULT_DECODER_NAME = os.getenv("UNISON_BCI_DECODER", "window")
 REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
@@ -70,6 +71,7 @@ _auth = AuthValidator(
 _ble_ingestor: Optional[BLEIngestor] = None
 _serial_ingestor: Optional[SerialIngestor] = None
 _raw_state: Dict[str, Dict[str, Any]] = {}
+_decoder_overrides: Dict[str, Dict[str, Any]] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -177,6 +179,14 @@ def _caps_payload() -> Dict[str, Any]:
     }
 
 
+def _decode_config(meta: Dict[str, Any]) -> Dict[str, Any]:
+    decoder_cfg = meta.get("decoder", {}) if isinstance(meta, dict) else {}
+    name = str(decoder_cfg.get("name") or DEFAULT_DECODER_NAME)
+    threshold = float(decoder_cfg.get("threshold", AMPLITUDE_THRESHOLD))
+    window = int(decoder_cfg.get("window_samples", WINDOW_SAMPLES))
+    return {"name": name, "threshold": threshold, "window_samples": window}
+
+
 def _emit_caps_report() -> None:
     caps = _caps_payload()
     envelope = {
@@ -246,26 +256,25 @@ def _emit_hid_mapping_if_any(intent_event: Dict[str, Any]) -> None:
 
 
 class LSLIngestor:
-    """Best-effort LSL ingest with a simple windowed amplitude decoder."""
+    """Best-effort LSL ingest with per-stream decoder selection (window or RMS)."""
 
     def __init__(self, registry: DeviceRegistry, emit_cb) -> None:
         self._registry = registry
         self._emit_cb = emit_cb
         self._stop = threading.Event()
         self._last_emit: Dict[str, float] = {}
-        self._window_decoder = WindowedDecoder(WINDOW_SAMPLES, AMPLITUDE_THRESHOLD)
-        self._rms_decoder = RMSDecoder(WINDOW_SAMPLES, AMPLITUDE_THRESHOLD)
+        self._decoders: Dict[str, Any] = {}
 
     def start(self) -> None:
         t = threading.Thread(target=self._run, daemon=True, name="bci-lsl-ingest")
         t.start()
 
-    def _should_emit(self, stream_id: str, magnitude: float) -> bool:
+    def _should_emit(self, stream_id: str, magnitude: float, threshold: float) -> bool:
         now = time.time()
         last = self._last_emit.get(stream_id, 0)
         if now - last < INTENT_COOLDOWN_SEC:
             return False
-        if magnitude < AMPLITUDE_THRESHOLD:
+        if magnitude < threshold:
             return False
         self._last_emit[stream_id] = now
         return True
@@ -301,6 +310,12 @@ class LSLIngestor:
                         channel_labels = []
                     meta = {"name": info.name(), "type": info.type(), "sample_rate": sr, "channel_labels": channel_labels}
                     self._registry.attach(stream_id, "eeg", meta)
+                    cfg = _decode_config(meta)
+                    self._decoders[stream_id] = (
+                        WindowedDecoder(cfg["window_samples"], cfg["threshold"])
+                        if cfg["name"] == "window"
+                        else RMSDecoder(cfg["window_samples"], cfg["threshold"])
+                    )
                     _raw_state.setdefault(
                         stream_id,
                         {
@@ -318,9 +333,16 @@ class LSLIngestor:
                         if not chunk:
                             time.sleep(0.05)
                             continue
-                        avg_mag, passed_mag = self._window_decoder.add_samples(stream_id, chunk)
-                        avg_rms, passed_rms = self._rms_decoder.add_samples(stream_id, chunk)
-                        passed = passed_mag or passed_rms
+                        decoder = self._decoders.get(stream_id)
+                        if decoder is None:
+                            cfg = _decode_config(meta)
+                            decoder = (
+                                WindowedDecoder(cfg["window_samples"], cfg["threshold"])
+                                if cfg["name"] == "window"
+                                else RMSDecoder(cfg["window_samples"], cfg["threshold"])
+                            )
+                            self._decoders[stream_id] = decoder
+                        avg_metric, passed = decoder.add_samples(stream_id, chunk)
                         # Accumulate raw into buffer for /bci/raw mirror/export
                         state = _raw_state.setdefault(
                             stream_id,
@@ -337,9 +359,10 @@ class LSLIngestor:
                             state["sample_index"] += 1
                             if len(state["samples"]) > MAX_BUFFER_SAMPLES:
                                 state["samples"] = state["samples"][-MAX_BUFFER_SAMPLES:]
-                        confidence_src = max(avg_mag, avg_rms)
-                        if passed and self._should_emit(stream_id, confidence_src):
-                            confidence = min(1.0, confidence_src / max(AMPLITUDE_THRESHOLD, 1e-3))
+                        cfg = _decode_config(meta)
+                        threshold = cfg.get("threshold", AMPLITUDE_THRESHOLD)
+                        if passed and self._should_emit(stream_id, avg_metric, threshold):
+                            confidence = min(1.0, avg_metric / max(threshold, 1e-3))
                             intent_event = _build_bci_intent("click", confidence=confidence)
                             intent_event["metadata"]["source_stream"] = stream_id
                             intent_event["intent"]["latency_ms"] = 0
@@ -459,6 +482,10 @@ def attach_device(payload: Dict[str, Any] = Body(...)):
     meta = payload.get("meta", {})
     if not isinstance(meta, dict):
         raise HTTPException(status_code=400, detail="meta must be an object")
+    decoder_cfg = _decode_config({"decoder": payload.get("decoder", {})})
+    meta["decoder"] = decoder_cfg
+    if payload.get("person_id"):
+        meta["person_id"] = payload.get("person_id")
     record = devices.attach(device_id, kind, meta)
     log_json(logging.INFO, "bci_device_attached", service=APP_NAME, device_id=device_id, kind=kind)
     return {"ok": True, "device": record}

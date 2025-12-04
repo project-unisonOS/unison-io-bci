@@ -4,7 +4,7 @@ import math
 
 
 class WindowedDecoder:
-    """Simple windowed amplitude/RMS decoder for EEG streams."""
+    """Simple windowed amplitude decoder for EEG streams."""
 
     def __init__(self, window_size: int, threshold: float):
         self.window_size = window_size
