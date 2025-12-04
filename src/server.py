@@ -439,7 +439,7 @@ def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
     notify_uuid = meta.get("notify_uuid")
     parser_name = meta.get("parser")
     if notify_uuid and parser_name and device_id not in _ble_stream_threads:
-        parser_fn = get_parser(parser_name)
+        parser_fn = get_parser(parser_name, meta)
         if parser_fn:
             stream = BLEStream(
                 address=meta.get("address") or device_id.replace("ble:", ""),
@@ -458,7 +458,7 @@ def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
             t.start()
     # Start serial stream if parser/baud provided
     if device_id.startswith("serial:") and parser_name and meta.get("serial_baud"):
-        parser_fn = get_parser(parser_name)
+        parser_fn = get_parser(parser_name, meta)
         if parser_fn:
             port = device_id.replace("serial:", "")
             threading.Thread(
