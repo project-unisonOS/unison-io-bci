@@ -17,6 +17,7 @@ from .auth import AuthValidator
 from .decoders import WindowedDecoder, RMSDecoder, DECODER_REGISTRY, make_decoder
 from .drivers.ble import BLEIngestor
 from .drivers.serial import SerialIngestor
+from .drivers.registry import get_profile
 from .hid import HIDEmitter
 
 try:
@@ -402,13 +403,16 @@ def _start_lsl_ingest():
 
 
 def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
+    profile = get_profile(device_id)
+    if profile:
+        meta = {**meta, **profile}
     devices.attach(device_id, kind, meta)
     log_json(logging.INFO, "device_detected", service=APP_NAME, device_id=device_id, kind=kind)
 
 
 def _start_ble_ingest():
     global _ble_ingestor
-    _ble_ingestor = BLEIngestor(_on_device_detect)
+    _ble_ingestor = BLEIngestor(_on_device_detect, profile_lookup=get_profile)
 
     async def _runner():
         await _ble_ingestor.scan()

@@ -113,3 +113,18 @@ class AuthValidator:
         if required_scope:
             return required_scope in scopes or "*" in scopes
         return True
+
+    def authorize_with_claims(self, token: str, required_scope: str | None = None) -> Optional[Dict[str, object]]:
+        if not token:
+            return None
+        claims = self._decode_jwt(token) or {}
+        scopes = self.get_scopes_from_claims(claims)
+        if required_scope and required_scope not in scopes:
+            consent_info = self._introspect_consent(token)
+            if consent_info:
+                consent_scopes = consent_info.get("scopes", [])
+                scopes.update(consent_scopes if isinstance(consent_scopes, list) else [])
+        if required_scope and required_scope not in scopes and "*" not in scopes:
+            return None
+        claims["scopes"] = list(scopes)
+        return claims
