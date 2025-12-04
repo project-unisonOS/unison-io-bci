@@ -465,11 +465,44 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                     stream["time_stamps"].append(now + i * 0.004)
             pyxdf.save_xdf(filename, [stream])
         else:
-            # EDF placeholder: write simple CSV-like EDF (not full EDF spec)
-            with open(filename, "w", encoding="utf-8") as f:
-                for sid, samples in _raw_buffers.items():
-                    for sample in samples:
-                        f.write(",".join(str(x) for x in sample) + "\n")
+            import pyedflib  # type: ignore
+
+            # Flatten buffers into signals; pad/truncate to same length
+            max_len = max((len(samples) for samples in _raw_buffers.values()), default=0)
+            if max_len == 0:
+                raise HTTPException(status_code=400, detail="no samples available to export")
+            channel_names = []
+            signals = []
+            for sid, samples in _raw_buffers.items():
+                channel_names.append(sid)
+                # Collapse multi-channel samples to average per timestep
+                flattened = [sum(s) / max(len(s), 1) for s in samples]
+                if len(flattened) < max_len:
+                    flattened.extend([0.0] * (max_len - len(flattened)))
+                else:
+                    flattened = flattened[:max_len]
+                signals.append(flattened)
+
+            n_channels = len(signals)
+            f = pyedflib.EdfWriter(filename, n_channels=n_channels)
+            channel_info = []
+            for name in channel_names:
+                channel_info.append(
+                    {
+                        "label": name[:16],
+                        "dimension": "uV",
+                        "sample_rate": 250,
+                        "physical_min": -1000,
+                        "physical_max": 1000,
+                        "digital_min": -32768,
+                        "digital_max": 32767,
+                        "transducer": "eeg",
+                        "prefilter": "",
+                    }
+                )
+            f.setSignalHeaders(channel_info)
+            f.writeSamples(signals)
+            f.close()
         return {"ok": True, "file": filename}
     except Exception as exc:
         log_json(logging.WARNING, "bci_export_failed", service=APP_NAME, error=str(exc))

@@ -7,5 +7,6 @@ bleak==0.22.3
 pyserial==3.5
 evdev==1.7.1
 pyxdf==1.16.5
+pyedflib==0.1.38
 
 # unison-common package (local install)
