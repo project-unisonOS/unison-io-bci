@@ -602,7 +602,10 @@ async def websocket_raw(ws: WebSocket):
         while True:
             # Stream snapshot of raw buffers (trimmed) and then sleep briefly
             payload = {"event": "raw.snapshot", "streams": {}}
+            requested = ws.query_params.get("stream")
             for sid, state in _raw_state.items():
+                if requested and sid != requested:
+                    continue
                 samples = state.get("samples", [])
                 payload["streams"][sid] = {
                     "count": len(samples),
