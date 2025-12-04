@@ -53,7 +53,7 @@ def test_export_success_and_invalid_format(tmp_path, monkeypatch):
     resp_bad = client.post("/bci/export", json={"format": "txt"})
     assert resp_bad.status_code == 400
     # Valid XDF
-    resp = client.post("/bci/export", json={"format": "xdf"})
+    resp = client.post("/bci/export", json={"format": "xdf"}, headers={"Authorization": "Bearer tok"})
     assert resp.status_code == 200
     assert "file" in resp.json()
     # Valid EDF
