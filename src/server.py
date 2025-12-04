@@ -14,7 +14,7 @@ from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketD
 import uvicorn
 
 from .auth import AuthValidator
-from .decoders import WindowedDecoder, RMSDecoder
+from .decoders import WindowedDecoder, RMSDecoder, DECODER_REGISTRY, make_decoder
 from .drivers.ble import BLEIngestor
 from .drivers.serial import SerialIngestor
 from .hid import HIDEmitter
@@ -311,11 +311,7 @@ class LSLIngestor:
                     meta = {"name": info.name(), "type": info.type(), "sample_rate": sr, "channel_labels": channel_labels}
                     self._registry.attach(stream_id, "eeg", meta)
                     cfg = _decode_config(meta)
-                    self._decoders[stream_id] = (
-                        WindowedDecoder(cfg["window_samples"], cfg["threshold"])
-                        if cfg["name"] == "window"
-                        else RMSDecoder(cfg["window_samples"], cfg["threshold"])
-                    )
+                    self._decoders[stream_id] = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"])
                     _raw_state.setdefault(
                         stream_id,
                         {
@@ -336,11 +332,7 @@ class LSLIngestor:
                         decoder = self._decoders.get(stream_id)
                         if decoder is None:
                             cfg = _decode_config(meta)
-                            decoder = (
-                                WindowedDecoder(cfg["window_samples"], cfg["threshold"])
-                                if cfg["name"] == "window"
-                                else RMSDecoder(cfg["window_samples"], cfg["threshold"])
-                            )
+                            decoder = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"])
                             self._decoders[stream_id] = decoder
                         avg_metric, passed = decoder.add_samples(stream_id, chunk)
                         # Accumulate raw into buffer for /bci/raw mirror/export
@@ -495,6 +487,11 @@ def attach_device(payload: Dict[str, Any] = Body(...)):
 def list_devices():
     _metrics["/bci/devices"] += 1
     return {"devices": devices.list()}
+
+
+@app.get("/bci/decoders")
+def list_decoders():
+    return {"decoders": DECODER_REGISTRY, "default": DEFAULT_DECODER_NAME}
 
 
 @app.post("/bci/hid-map")

@@ -15,6 +15,7 @@ Phase 1 MVP scaffold — joins devstack alongside other `unison-io-*` services.
 ## APIs (MVP)
 - `GET /health`, `GET /ready`, `GET /metrics`
 - `POST /bci/devices/attach` — attach a discovered stream to a decoder profile (supports `decoder {name: window|rms, threshold, window_samples}` and optional `person_id`).
+- `GET /bci/decoders` — list available decoders and defaults.
 - `GET /bci/devices` — list attached streams.
 - `WS /bci/intents` — subscribe to decoded intents (requires `bci.intent.subscribe` scope; push-only).
 - `WS /bci/raw` — diagnostics/raw mirror (requires `bci.raw.read`).

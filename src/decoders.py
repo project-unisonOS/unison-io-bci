@@ -2,6 +2,19 @@ from collections import deque
 from typing import Deque, Dict, List, Tuple
 import math
 
+DECODER_REGISTRY = [
+    {
+        "name": "window",
+        "description": "Mean absolute amplitude over sliding window",
+        "params": {"threshold": "float", "window_samples": "int"},
+    },
+    {
+        "name": "rms",
+        "description": "Root-mean-square amplitude over sliding window",
+        "params": {"threshold": "float", "window_samples": "int"},
+    },
+]
+
 
 class WindowedDecoder:
     """Simple windowed amplitude decoder for EEG streams."""
@@ -49,3 +62,9 @@ class RMSDecoder:
             return 0.0, False
         avg_rms = sum(window) / max(len(window), 1)
         return avg_rms, avg_rms >= self.threshold
+
+
+def make_decoder(name: str, window_size: int, threshold: float):
+    if name == "rms":
+        return RMSDecoder(window_size, threshold)
+    return WindowedDecoder(window_size, threshold)
