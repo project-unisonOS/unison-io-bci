@@ -35,6 +35,8 @@ Environment:
 - `BCI_SERVICE_HOST` / `BCI_SERVICE_PORT` — bind host/port (default 0.0.0.0:8089).
 - `UNISON_BCI_ENABLE_DEMO` — emit periodic demo `bci.intent` events (default false).
 - `UNISON_HAS_BCI_ADAPTER` — advertise BCI capability in `caps.report` (default true).
+- `UNISON_BCI_AMPLITUDE_THRESHOLD` — simple amplitude threshold for demo LSL decoder (µV-ish units).
+- `UNISON_BCI_INTENT_COOLDOWN_SEC` — cooldown between decoded intents per stream.
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.
@@ -42,6 +44,6 @@ Environment:
 - `tests/` — unit/integration tests (TODO).
 
 ## Next steps
-- Implement actual LSL/buffered ingest and decoder plugins.
+- Harden LSL ingest with buffering/windowed features and add BLE/USB drivers.
 - Enforce auth/consent scopes on WS and attach/export endpoints.
 - Add HID mapping layer and virtual device integration.

@@ -14,6 +14,12 @@ from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketD
 import uvicorn
 
 try:
+    from pylsl import StreamInlet, resolve_byprop  # type: ignore
+    _PYLSL_AVAILABLE = True
+except Exception:
+    _PYLSL_AVAILABLE = False
+
+try:
     from unison_common.logging import configure_logging, log_json
     from unison_common.baton import get_current_baton
     from unison_common import BatonMiddleware
@@ -27,6 +33,8 @@ DEFAULT_PERSON_ID = os.getenv("UNISON_DEFAULT_PERSON_ID", "local-user")
 SERVICE_HOST = os.getenv("BCI_SERVICE_HOST", "0.0.0.0")
 SERVICE_PORT = int(os.getenv("BCI_SERVICE_PORT", "8089"))
 ENABLE_DEMO = os.getenv("UNISON_BCI_ENABLE_DEMO", "false").lower() in {"1", "true", "yes", "on"}
+AMPLITUDE_THRESHOLD = float(os.getenv("UNISON_BCI_AMPLITUDE_THRESHOLD", "75.0"))
+INTENT_COOLDOWN_SEC = float(os.getenv("UNISON_BCI_INTENT_COOLDOWN_SEC", "3.0"))
 
 logger = configure_logging(APP_NAME) if "configure_logging" in globals() else logging.getLogger(APP_NAME)
 app = FastAPI(title=APP_NAME)
@@ -111,6 +119,7 @@ class IntentBroadcaster:
 
 devices = DeviceRegistry()
 broadcaster = IntentBroadcaster()
+_lsl_ingestor = None
 
 
 def _caps_payload() -> Dict[str, Any]:
@@ -169,6 +178,72 @@ async def _emit_bci_intent_event(intent_event: Dict[str, Any]) -> None:
     await broadcaster.broadcast(intent_event)
 
 
+class LSLIngestor:
+    """Best-effort LSL ingest with a simple amplitude-based decoder."""
+
+    def __init__(self, registry: DeviceRegistry, emit_cb) -> None:
+        self._registry = registry
+        self._emit_cb = emit_cb
+        self._stop = threading.Event()
+        self._last_emit: Dict[str, float] = {}
+
+    def start(self) -> None:
+        t = threading.Thread(target=self._run, daemon=True, name="bci-lsl-ingest")
+        t.start()
+
+    def _should_emit(self, stream_id: str, magnitude: float) -> bool:
+        now = time.time()
+        last = self._last_emit.get(stream_id, 0)
+        if now - last < INTENT_COOLDOWN_SEC:
+            return False
+        if magnitude < AMPLITUDE_THRESHOLD:
+            return False
+        self._last_emit[stream_id] = now
+        return True
+
+    def _run(self) -> None:
+        if not _PYLSL_AVAILABLE:
+            logger.info("pylsl_not_available; skipping LSL ingest")
+            return
+        log_json(logging.INFO, "lsl_ingest_start", service=APP_NAME, threshold=AMPLITUDE_THRESHOLD)
+        while not self._stop.is_set():
+            try:
+                streams = resolve_byprop("type", "EEG", timeout=2.0)
+            except Exception as exc:  # pragma: no cover
+                logger.warning("lsl_resolve_error %s", exc)
+                time.sleep(2)
+                continue
+
+            for info in streams:
+                try:
+                    stream_id = f"lsl:{info.uid()}"
+                    inlet = StreamInlet(info, max_buflen=1)
+                    self._registry.attach(stream_id, "eeg", {"name": info.name(), "type": info.type()})
+                    log_json(logging.INFO, "lsl_inlet_opened", service=APP_NAME, stream_id=stream_id, name=info.name())
+
+                    while not self._stop.is_set():
+                        chunk, timestamps = inlet.pull_chunk(timeout=0.0)
+                        if not chunk:
+                            time.sleep(0.05)
+                            continue
+                        # Simple decoder: average absolute amplitude across channels per sample
+                        for sample in chunk:
+                            magnitude = sum(abs(x) for x in sample) / max(len(sample), 1)
+                            if self._should_emit(stream_id, magnitude):
+                                confidence = min(1.0, magnitude / max(AMPLITUDE_THRESHOLD, 1e-3))
+                                intent_event = _build_bci_intent("click", confidence=confidence)
+                                intent_event["metadata"]["source_stream"] = stream_id
+                                intent_event["intent"]["latency_ms"] = 0
+                                asyncio.run(self._emit_cb(intent_event))
+                except Exception as exc:  # pragma: no cover
+                    logger.warning("lsl_ingest_error %s", exc)
+                    time.sleep(1)
+            time.sleep(2)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 def _demo_loop():
     """Emit a demo BCI intent periodically for quick plumbing verification."""
     while True:
@@ -188,34 +263,10 @@ def _start_demo_if_enabled():
     logger.info("demo_intent_loop_started")
 
 
-def _lsl_discovery_loop():
-    """Best-effort LSL discovery to surface device presence."""
-    try:
-        from pylsl import resolve_streams  # type: ignore
-    except Exception:
-        logger.info("pylsl_not_available; skipping LSL discovery")
-        return
-
-    seen: Set[str] = set()
-    logger.info("lsl_discovery_started")
-    while True:
-        try:
-            streams = resolve_streams(timeout=2.0)
-            for s in streams:
-                stream_id = f"lsl:{getattr(s, 'uid', lambda: s.name)()}"
-                if stream_id in seen:
-                    continue
-                seen.add(stream_id)
-                devices.attach(stream_id, "eeg", {"name": getattr(s, 'name', lambda: 'lsl')(), "type": getattr(s, 'type', lambda: '')()})
-                log_json(logging.INFO, "lsl_device_detected", service=APP_NAME, stream_id=stream_id)
-        except Exception as exc:
-            logger.warning("lsl_discovery_error %s", exc)
-        time.sleep(5)
-
-
-def _start_lsl_discovery():
-    t = threading.Thread(target=_lsl_discovery_loop, daemon=True, name="bci-lsl-discovery")
-    t.start()
+def _start_lsl_ingest():
+    global _lsl_ingestor
+    _lsl_ingestor = LSLIngestor(devices, emit_cb=_emit_bci_intent_event)
+    _lsl_ingestor.start()
 
 
 @app.on_event("startup")
@@ -225,7 +276,7 @@ def _on_startup():
     except Exception as exc:  # pragma: no cover
         logger.warning("caps_report_failed %s", exc)
     _start_demo_if_enabled()
-    _start_lsl_discovery()
+    _start_lsl_ingest()
 
 
 @app.get("/healthz")
