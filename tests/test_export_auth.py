@@ -17,7 +17,7 @@ def test_export_requires_scope(monkeypatch):
             return "tok"
 
     server._auth = DummyAuth()  # type: ignore
-    resp = client.post("/bci/export", json={"format": "xdf"})
+    resp = client.post("/bci/export", json={"format": "xdf"}, headers={"Authorization": "Bearer tok"})
     assert resp.status_code == 403
     assert "missing required scope" in resp.text
 

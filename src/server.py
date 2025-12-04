@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, Depends
 import uvicorn
 
 from .auth import AuthValidator
@@ -171,6 +171,13 @@ def _require_scope_ws(ws: WebSocket, required: str | None) -> bool:
         return True
     token = _auth.extract_token(ws.headers.get("Authorization"), ws.query_params.get("token"))
     return bool(token and _auth.authorize(token, required))
+
+
+def require_scope_dep(required: str):
+    async def _dep(request: Request):
+        _require_scope_request(request, required)
+        return True
+    return _dep
 
 
 def _caps_payload() -> Dict[str, Any]:
@@ -467,7 +474,7 @@ def metrics():
 
 
 @app.post("/bci/devices/attach")
-def attach_device(payload: Dict[str, Any] = Body(...)):
+def attach_device(payload: Dict[str, Any] = Body(...), _: bool = Depends(require_scope_dep(REQUIRED_SCOPE_INTENTS))):
     _metrics["/bci/devices/attach"] += 1
     device_id = payload.get("device_id") or f"manual:{uuid.uuid4()}"
     kind = payload.get("kind", "eeg")
@@ -484,7 +491,7 @@ def attach_device(payload: Dict[str, Any] = Body(...)):
 
 
 @app.get("/bci/devices")
-def list_devices():
+def list_devices(_: bool = Depends(require_scope_dep(REQUIRED_SCOPE_INTENTS))):
     _metrics["/bci/devices"] += 1
     return {"devices": devices.list()}
 
@@ -495,9 +502,8 @@ def list_decoders():
 
 
 @app.post("/bci/hid-map")
-def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
+def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...), _: bool = Depends(require_scope_dep(REQUIRED_SCOPE_HID))):
     _metrics["/bci/hid-map"] += 1
-    _require_scope_request(request, REQUIRED_SCOPE_HID)
     # Stub: store mapping in memory for now
     mappings = payload.get("mappings")
     if not isinstance(mappings, dict):
@@ -509,8 +515,7 @@ def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
 
 
 @app.post("/bci/export")
-def export_raw(request: Request, format: str = Body(..., embed=True, default="xdf")):
-    _require_scope_request(request, REQUIRED_SCOPE_EXPORT)
+def export_raw(request: Request, format: str = Body(..., embed=True, default="xdf"), _: bool = Depends(require_scope_dep(REQUIRED_SCOPE_EXPORT))):
     fmt = format.lower()
     if fmt not in {"xdf", "edf"}:
         raise HTTPException(status_code=400, detail="unsupported format; use xdf or edf")
