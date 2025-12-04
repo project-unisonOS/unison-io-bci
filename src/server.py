@@ -35,6 +35,10 @@ SERVICE_PORT = int(os.getenv("BCI_SERVICE_PORT", "8089"))
 ENABLE_DEMO = os.getenv("UNISON_BCI_ENABLE_DEMO", "false").lower() in {"1", "true", "yes", "on"}
 AMPLITUDE_THRESHOLD = float(os.getenv("UNISON_BCI_AMPLITUDE_THRESHOLD", "75.0"))
 INTENT_COOLDOWN_SEC = float(os.getenv("UNISON_BCI_INTENT_COOLDOWN_SEC", "3.0"))
+WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
+REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
+REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
+REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
 
 logger = configure_logging(APP_NAME) if "configure_logging" in globals() else logging.getLogger(APP_NAME)
 app = FastAPI(title=APP_NAME)
@@ -43,6 +47,7 @@ if BatonMiddleware:
 
 _metrics = defaultdict(int)
 _start_time = time.time()
+_hid_mappings: Dict[str, str] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -122,6 +127,25 @@ broadcaster = IntentBroadcaster()
 _lsl_ingestor = None
 
 
+def _has_scope(request: Request, required: str) -> bool:
+    # Accept scopes in X-Auth-Scopes (comma-separated) or Authorization: Bearer scopes=...
+    scopes_raw = request.headers.get("X-Auth-Scopes") or request.headers.get("X-Scopes")
+    scopes: Set[str] = set()
+    if scopes_raw:
+        scopes = {s.strip() for s in scopes_raw.split(",") if s.strip()}
+    auth = request.headers.get("Authorization") or ""
+    if "scopes=" in auth:
+        for part in auth.split():
+            if part.startswith("scopes="):
+                scopes.update({s.strip() for s in part.split("=", 1)[1].split(",") if s.strip()})
+    return required in scopes or "*" in scopes
+
+
+def _require_scope(request: Request, required: str):
+    if not _has_scope(request, required):
+        raise HTTPException(status_code=403, detail=f"missing required scope: {required}")
+
+
 def _caps_payload() -> Dict[str, Any]:
     return {
         "bci_adapter": {"present": _env_flag("UNISON_HAS_BCI_ADAPTER", True), "confidence": 0.8},
@@ -176,16 +200,34 @@ async def _emit_bci_intent_event(intent_event: Dict[str, Any]) -> None:
         confidence=intent_event.get("intent", {}).get("confidence"),
     )
     await broadcaster.broadcast(intent_event)
+    _emit_hid_mapping_if_any(intent_event)
+
+
+def _emit_hid_mapping_if_any(intent_event: Dict[str, Any]) -> None:
+    cmd = (intent_event.get("intent") or {}).get("command")
+    if cmd and cmd in _hid_mappings:
+        hid_event = {
+            "schema_version": "2.0",
+            "id": str(uuid.uuid4()),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "source": APP_NAME,
+            "event_type": "input.hid",
+            "payload": {"mapping": cmd, "hid_event": _hid_mappings[cmd]},
+            "person": intent_event.get("person"),
+            "auth_scope": "bci.hid.map",
+        }
+        http_post_json(ORCH_HOST, ORCH_PORT, "/event", hid_event)
 
 
 class LSLIngestor:
-    """Best-effort LSL ingest with a simple amplitude-based decoder."""
+    """Best-effort LSL ingest with a simple windowed amplitude decoder."""
 
     def __init__(self, registry: DeviceRegistry, emit_cb) -> None:
         self._registry = registry
         self._emit_cb = emit_cb
         self._stop = threading.Event()
         self._last_emit: Dict[str, float] = {}
+        self._windows: Dict[str, List[float]] = defaultdict(list)
 
     def start(self) -> None:
         t = threading.Thread(target=self._run, daemon=True, name="bci-lsl-ingest")
@@ -226,11 +268,18 @@ class LSLIngestor:
                         if not chunk:
                             time.sleep(0.05)
                             continue
-                        # Simple decoder: average absolute amplitude across channels per sample
+                        # Windowed decoder: average absolute amplitude across channels per sample, then over window
                         for sample in chunk:
                             magnitude = sum(abs(x) for x in sample) / max(len(sample), 1)
-                            if self._should_emit(stream_id, magnitude):
-                                confidence = min(1.0, magnitude / max(AMPLITUDE_THRESHOLD, 1e-3))
+                            window = self._windows[stream_id]
+                            window.append(magnitude)
+                            if len(window) > WINDOW_SAMPLES:
+                                window.pop(0)
+                            if len(window) < WINDOW_SAMPLES:
+                                continue
+                            avg_mag = sum(window) / max(len(window), 1)
+                            if self._should_emit(stream_id, avg_mag):
+                                confidence = min(1.0, avg_mag / max(AMPLITUDE_THRESHOLD, 1e-3))
                                 intent_event = _build_bci_intent("click", confidence=confidence)
                                 intent_event["metadata"]["source_stream"] = stream_id
                                 intent_event["intent"]["latency_ms"] = 0
@@ -293,6 +342,7 @@ def health(request: Request):
 def ready(request: Request):
     _metrics["/ready"] += 1
     event_id = request.headers.get("X-Event-ID")
+    _require_scope(request, REQUIRED_SCOPE_INTENTS) if REQUIRED_SCOPE_INTENTS else None
     ok, _, _ = http_post_json(ORCH_HOST, ORCH_PORT, "/health", {}, headers={"X-Event-ID": event_id})
     log_json(logging.INFO, "ready", service=APP_NAME, event_id=event_id, orchestrator_ok=ok)
     return {"ready": ok, "orchestrator": {"host": ORCH_HOST, "port": ORCH_PORT, "ok": ok}}
@@ -336,18 +386,25 @@ def list_devices():
 
 
 @app.post("/bci/hid-map")
-def set_hid_map(payload: Dict[str, Any] = Body(...)):
+def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
     _metrics["/bci/hid-map"] += 1
+    _require_scope(request, REQUIRED_SCOPE_HID) if REQUIRED_SCOPE_HID else None
     # Stub: store mapping in memory for now
     mappings = payload.get("mappings")
     if not isinstance(mappings, dict):
         raise HTTPException(status_code=400, detail="mappings must be an object")
-    log_json(logging.INFO, "hid_map_updated", service=APP_NAME, mappings=list(mappings.keys()))
-    return {"ok": True, "mappings": mappings}
+    _hid_mappings.clear()
+    _hid_mappings.update({str(k): str(v) for k, v in mappings.items()})
+    log_json(logging.INFO, "hid_map_updated", service=APP_NAME, mappings=list(_hid_mappings.keys()))
+    return {"ok": True, "mappings": _hid_mappings}
 
 
 @app.websocket("/bci/intents")
 async def websocket_intents(ws: WebSocket):
+    scopes_raw = ws.headers.get("X-Auth-Scopes") or ws.headers.get("X-Scopes") or ""
+    if REQUIRED_SCOPE_INTENTS and REQUIRED_SCOPE_INTENTS not in scopes_raw and "*" not in scopes_raw:
+        await ws.close(code=4403)
+        return
     await broadcaster.register(ws)
     try:
         while True:
@@ -363,6 +420,10 @@ async def websocket_intents(ws: WebSocket):
 
 @app.websocket("/bci/raw")
 async def websocket_raw(ws: WebSocket):
+    scopes_raw = ws.headers.get("X-Auth-Scopes") or ws.headers.get("X-Scopes") or ""
+    if REQUIRED_SCOPE_RAW and REQUIRED_SCOPE_RAW not in scopes_raw and "*" not in scopes_raw:
+        await ws.close(code=4403)
+        return
     await ws.accept()
     try:
         await ws.send_json({"event": "raw.not_implemented", "service": APP_NAME})

@@ -37,6 +37,8 @@ Environment:
 - `UNISON_HAS_BCI_ADAPTER` — advertise BCI capability in `caps.report` (default true).
 - `UNISON_BCI_AMPLITUDE_THRESHOLD` — simple amplitude threshold for demo LSL decoder (µV-ish units).
 - `UNISON_BCI_INTENT_COOLDOWN_SEC` — cooldown between decoded intents per stream.
+- `UNISON_BCI_WINDOW_SAMPLES` — window size for amplitude averaging before decoding.
+- `UNISON_BCI_SCOPE_INTENTS` / `UNISON_BCI_SCOPE_RAW` / `UNISON_BCI_SCOPE_HID` — required scopes checked on WS/endpoints.
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.
@@ -44,6 +46,6 @@ Environment:
 - `tests/` — unit/integration tests (TODO).
 
 ## Next steps
-- Harden LSL ingest with buffering/windowed features and add BLE/USB drivers.
-- Enforce auth/consent scopes on WS and attach/export endpoints.
-- Add HID mapping layer and virtual device integration.
+- Extend decoder plugins (SSVEP/SMR), add BLE/USB drivers, and expose raw stream mirroring.
+- Harden auth/consent enforcement with JWT/consent validation (current headers-based scopes are a stopgap).
+- Integrate real HID virtual device support (evdev/uinput) and export/calibration endpoints.
