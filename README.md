@@ -17,8 +17,9 @@ Phase 1 MVP scaffold — joins devstack alongside other `unison-io-*` services.
 - `POST /bci/devices/attach` — attach a discovered stream to a decoder profile.
 - `GET /bci/devices` — list attached streams.
 - `WS /bci/intents` — subscribe to decoded intents (requires `bci.intent.subscribe` scope; push-only).
-- `WS /bci/raw` — diagnostics/raw mirror (stubbed for now; requires `bci.raw.read`).
+- `WS /bci/raw` — diagnostics/raw mirror (requires `bci.raw.read`).
 - `POST /bci/hid-map` — configure BCI→virtual HID mappings (requires `bci.hid.map`).
+- `POST /bci/export` — export buffered raw to XDF/EDF (requires `bci.export`; XDF path best effort).
 - Best-effort `caps.report` emission on startup (`bci_adapter: {present: true}`).
 - Best-effort BLE scan and serial probe to detect known EEG devices; LSL ingest for EEG streams.
 - Optional virtual HID output using `evdev/uinput` when available; otherwise logs.
@@ -43,6 +44,7 @@ Environment:
 - `UNISON_BCI_SCOPE_INTENTS` / `UNISON_BCI_SCOPE_RAW` / `UNISON_BCI_SCOPE_HID` — required scopes checked on WS/endpoints.
 - `UNISON_BCI_AUTH_JWKS_URL`, `UNISON_BCI_AUTH_AUDIENCE`, `UNISON_BCI_AUTH_ISSUER` — JWT validation for scopes (recommended).
 - `UNISON_BCI_CONSENT_INTROSPECT_URL` — optional consent introspection endpoint (e.g., consent `/introspect`).
+- `UNISON_BCI_SCOPE_EXPORT` — scope required for export endpoints (default `bci.export`).
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.

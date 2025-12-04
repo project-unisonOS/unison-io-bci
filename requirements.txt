@@ -6,5 +6,6 @@ python-jose[cryptography]==3.3.0
 bleak==0.22.3
 pyserial==3.5
 evdev==1.7.1
+pyxdf==1.16.5
 
 # unison-common package (local install)

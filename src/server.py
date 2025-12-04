@@ -45,6 +45,7 @@ WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
 REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
+REQUIRED_SCOPE_EXPORT = os.getenv("UNISON_BCI_SCOPE_EXPORT", "bci.export")
 AUTH_JWKS_URL = os.getenv("UNISON_BCI_AUTH_JWKS_URL", "")
 AUTH_AUDIENCE = os.getenv("UNISON_BCI_AUTH_AUDIENCE", "")
 AUTH_ISSUER = os.getenv("UNISON_BCI_AUTH_ISSUER", "")
@@ -67,6 +68,7 @@ _auth = AuthValidator(
 )
 _ble_ingestor: Optional[BLEIngestor] = None
 _serial_ingestor: Optional[SerialIngestor] = None
+_raw_buffers: Dict[str, List[float]] = defaultdict(list)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -288,6 +290,11 @@ class LSLIngestor:
                         avg_mag, passed_mag = self._window_decoder.add_samples(stream_id, chunk)
                         avg_rms, passed_rms = self._rms_decoder.add_samples(stream_id, chunk)
                         passed = passed_mag or passed_rms
+                        # Accumulate raw into buffer for /bci/raw mirror/export
+                        for sample in chunk:
+                            _raw_buffers[stream_id].append(sample)
+                            if len(_raw_buffers[stream_id]) > 1000:
+                                _raw_buffers[stream_id] = _raw_buffers[stream_id][-1000:]
                         confidence_src = max(avg_mag, avg_rms)
                         if passed and self._should_emit(stream_id, confidence_src):
                             confidence = min(1.0, confidence_src / max(AMPLITUDE_THRESHOLD, 1e-3))
@@ -435,6 +442,40 @@ def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...)):
     return {"ok": True, "mappings": _hid_mappings}
 
 
+@app.post("/bci/export")
+def export_raw(request: Request, format: str = Body(..., embed=True, default="xdf")):
+    _require_scope_request(request, REQUIRED_SCOPE_EXPORT)
+    fmt = format.lower()
+    if fmt not in {"xdf", "edf"}:
+        raise HTTPException(status_code=400, detail="unsupported format; use xdf or edf")
+    filename = f"/tmp/bci_export_{int(time.time())}.{fmt}"
+    try:
+        if fmt == "xdf":
+            # Minimal XDF with one stream containing concatenated samples
+            import pyxdf  # type: ignore
+            stream = {
+                "info": {"name": "unison-bci-raw", "type": "EEG"},
+                "time_series": [],
+                "time_stamps": [],
+            }
+            now = time.time()
+            for sid, samples in _raw_buffers.items():
+                for i, sample in enumerate(samples):
+                    stream["time_series"].append(sample)
+                    stream["time_stamps"].append(now + i * 0.004)
+            pyxdf.save_xdf(filename, [stream])
+        else:
+            # EDF placeholder: write simple CSV-like EDF (not full EDF spec)
+            with open(filename, "w", encoding="utf-8") as f:
+                for sid, samples in _raw_buffers.items():
+                    for sample in samples:
+                        f.write(",".join(str(x) for x in sample) + "\n")
+        return {"ok": True, "file": filename}
+    except Exception as exc:
+        log_json(logging.WARNING, "bci_export_failed", service=APP_NAME, error=str(exc))
+        raise HTTPException(status_code=500, detail="export failed")
+
+
 @app.websocket("/bci/intents")
 async def websocket_intents(ws: WebSocket):
     if not _require_scope_ws(ws, REQUIRED_SCOPE_INTENTS):
@@ -460,13 +501,20 @@ async def websocket_raw(ws: WebSocket):
         return
     await ws.accept()
     try:
-        await ws.send_json({"event": "raw.not_implemented", "service": APP_NAME})
-        await ws.close()
+        while True:
+            # Stream snapshot of raw buffers (trimmed) and then sleep briefly
+            payload = {"event": "raw.snapshot", "streams": {}}
+            for sid, samples in _raw_buffers.items():
+                payload["streams"][sid] = {
+                    "count": len(samples),
+                    "samples": samples[-100:],  # keep payload small
+                }
+            await ws.send_json(payload)
+            await asyncio.sleep(1.0)
+    except WebSocketDisconnect:
+        return
     except Exception:
-        try:
-            await ws.close()
-        except Exception:
-            pass
+        await ws.close()
 
 
 if __name__ == "__main__":
