@@ -42,6 +42,7 @@ ENABLE_DEMO = os.getenv("UNISON_BCI_ENABLE_DEMO", "false").lower() in {"1", "tru
 AMPLITUDE_THRESHOLD = float(os.getenv("UNISON_BCI_AMPLITUDE_THRESHOLD", "75.0"))
 INTENT_COOLDOWN_SEC = float(os.getenv("UNISON_BCI_INTENT_COOLDOWN_SEC", "3.0"))
 WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
+MAX_BUFFER_SAMPLES = int(os.getenv("UNISON_BCI_MAX_BUFFER_SAMPLES", "5000"))
 REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
@@ -68,7 +69,7 @@ _auth = AuthValidator(
 )
 _ble_ingestor: Optional[BLEIngestor] = None
 _serial_ingestor: Optional[SerialIngestor] = None
-_raw_buffers: Dict[str, List[float]] = defaultdict(list)
+_raw_state: Dict[str, Dict[str, Any]] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -112,6 +113,13 @@ class DeviceRegistry:
     def list(self) -> List[Dict[str, Any]]:
         with self._lock:
             return list(self._devices.values())
+
+    def meta(self, device_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            dev = self._devices.get(device_id)
+            if not dev:
+                return None
+            return dev.get("meta", {})
 
 
 class IntentBroadcaster:
@@ -279,7 +287,30 @@ class LSLIngestor:
                 try:
                     stream_id = f"lsl:{info.uid()}"
                     inlet = StreamInlet(info, max_buflen=1)
-                    self._registry.attach(stream_id, "eeg", {"name": info.name(), "type": info.type()})
+                    sr = info.nominal_srate() or 250
+                    channel_labels: List[str] = []
+                    try:
+                        desc = info.desc()
+                        ch = desc.child("channels").child("channel")
+                        while ch:
+                            label = ch.child_value("label")
+                            if label:
+                                channel_labels.append(label)
+                            ch = ch.next_sibling()
+                    except Exception:
+                        channel_labels = []
+                    meta = {"name": info.name(), "type": info.type(), "sample_rate": sr, "channel_labels": channel_labels}
+                    self._registry.attach(stream_id, "eeg", meta)
+                    _raw_state.setdefault(
+                        stream_id,
+                        {
+                            "samples": [],
+                            "sample_rate": sr,
+                            "channel_labels": channel_labels,
+                            "start_time": time.time(),
+                            "sample_index": 0,
+                        },
+                    )
                     log_json(logging.INFO, "lsl_inlet_opened", service=APP_NAME, stream_id=stream_id, name=info.name())
 
                     while not self._stop.is_set():
@@ -291,10 +322,21 @@ class LSLIngestor:
                         avg_rms, passed_rms = self._rms_decoder.add_samples(stream_id, chunk)
                         passed = passed_mag or passed_rms
                         # Accumulate raw into buffer for /bci/raw mirror/export
+                        state = _raw_state.setdefault(
+                            stream_id,
+                            {
+                                "samples": [],
+                                "sample_rate": sr,
+                                "channel_labels": channel_labels,
+                                "start_time": time.time(),
+                                "sample_index": 0,
+                            },
+                        )
                         for sample in chunk:
-                            _raw_buffers[stream_id].append(sample)
-                            if len(_raw_buffers[stream_id]) > 1000:
-                                _raw_buffers[stream_id] = _raw_buffers[stream_id][-1000:]
+                            state["samples"].append(sample)
+                            state["sample_index"] += 1
+                            if len(state["samples"]) > MAX_BUFFER_SAMPLES:
+                                state["samples"] = state["samples"][-MAX_BUFFER_SAMPLES:]
                         confidence_src = max(avg_mag, avg_rms)
                         if passed and self._should_emit(stream_id, confidence_src):
                             confidence = min(1.0, confidence_src / max(AMPLITUDE_THRESHOLD, 1e-3))
@@ -453,35 +495,58 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
         if fmt == "xdf":
             # Minimal XDF with one stream containing concatenated samples
             import pyxdf  # type: ignore
-            stream = {
-                "info": {"name": "unison-bci-raw", "type": "EEG"},
-                "time_series": [],
-                "time_stamps": [],
-            }
-            now = time.time()
-            for sid, samples in _raw_buffers.items():
-                for i, sample in enumerate(samples):
-                    stream["time_series"].append(sample)
-                    stream["time_stamps"].append(now + i * 0.004)
-            pyxdf.save_xdf(filename, [stream])
+            streams = []
+            for sid, state in _raw_state.items():
+                samples = state.get("samples", [])
+                if not samples:
+                    continue
+                sr = state.get("sample_rate") or 250
+                start = state.get("start_time", time.time())
+                labels = state.get("channel_labels") or []
+                streams.append(
+                    {
+                        "info": {"name": sid, "type": "EEG", "sample_rate": sr, "channel_labels": labels},
+                        "time_series": samples,
+                        "time_stamps": [start + i / sr for i in range(len(samples))],
+                    }
+                )
+            if not streams:
+                raise HTTPException(status_code=400, detail="no samples available to export")
+            pyxdf.save_xdf(filename, streams)
         else:
             import pyedflib  # type: ignore
 
             # Flatten buffers into signals; pad/truncate to same length
-            max_len = max((len(samples) for samples in _raw_buffers.values()), default=0)
+            max_len = max((len(state.get("samples", [])) for state in _raw_state.values()), default=0)
             if max_len == 0:
                 raise HTTPException(status_code=400, detail="no samples available to export")
             channel_names = []
             signals = []
-            for sid, samples in _raw_buffers.items():
-                channel_names.append(sid)
-                # Collapse multi-channel samples to average per timestep
-                flattened = [sum(s) / max(len(s), 1) for s in samples]
-                if len(flattened) < max_len:
-                    flattened.extend([0.0] * (max_len - len(flattened)))
+            sample_rates = []
+            for sid, state in _raw_state.items():
+                samples = state.get("samples", [])
+                if not samples:
+                    continue
+                sr = state.get("sample_rate") or 250
+                labels = state.get("channel_labels") or []
+                sample_rates.append(sr)
+                if labels:
+                    channel_names.extend(labels)
+                    # transpose channel-major
+                    transposed = list(map(list, zip(*samples)))
+                    for chan_samples in transposed:
+                        sig = chan_samples[:max_len]
+                        if len(sig) < max_len:
+                            sig.extend([0.0] * (max_len - len(sig)))
+                        signals.append(sig)
                 else:
-                    flattened = flattened[:max_len]
-                signals.append(flattened)
+                    channel_names.append(sid)
+                    flattened = [sum(s) / max(len(s), 1) for s in samples]
+                    if len(flattened) < max_len:
+                        flattened.extend([0.0] * (max_len - len(flattened)))
+                    else:
+                        flattened = flattened[:max_len]
+                    signals.append(flattened)
 
             n_channels = len(signals)
             f = pyedflib.EdfWriter(filename, n_channels=n_channels)
@@ -491,7 +556,7 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                     {
                         "label": name[:16],
                         "dimension": "uV",
-                        "sample_rate": 250,
+                        "sample_rate": sample_rates[0] if sample_rates else 250,
                         "physical_min": -1000,
                         "physical_max": 1000,
                         "digital_min": -32768,
@@ -537,10 +602,13 @@ async def websocket_raw(ws: WebSocket):
         while True:
             # Stream snapshot of raw buffers (trimmed) and then sleep briefly
             payload = {"event": "raw.snapshot", "streams": {}}
-            for sid, samples in _raw_buffers.items():
+            for sid, state in _raw_state.items():
+                samples = state.get("samples", [])
                 payload["streams"][sid] = {
                     "count": len(samples),
                     "samples": samples[-100:],  # keep payload small
+                    "sample_rate": state.get("sample_rate"),
+                    "channel_labels": state.get("channel_labels") or [],
                 }
             await ws.send_json(payload)
             await asyncio.sleep(1.0)

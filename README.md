@@ -45,6 +45,7 @@ Environment:
 - `UNISON_BCI_AUTH_JWKS_URL`, `UNISON_BCI_AUTH_AUDIENCE`, `UNISON_BCI_AUTH_ISSUER` — JWT validation for scopes (recommended).
 - `UNISON_BCI_CONSENT_INTROSPECT_URL` — optional consent introspection endpoint (e.g., consent `/introspect`).
 - `UNISON_BCI_SCOPE_EXPORT` — scope required for export endpoints (default `bci.export`).
+- `UNISON_BCI_MAX_BUFFER_SAMPLES` — max samples retained per stream for raw mirror/export.
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.
