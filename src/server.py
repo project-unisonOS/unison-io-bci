@@ -17,8 +17,9 @@ import uvicorn
 from .auth import AuthValidator
 from .decoders import WindowedDecoder, RMSDecoder, DECODER_REGISTRY, make_decoder
 from .drivers.ble import BLEIngestor
+from .drivers.ble_stream import BLEStream
 from .drivers.serial import SerialIngestor
-from .drivers.registry import get_profile
+from .drivers.registry import get_profile, get_parser
 from .hid import HIDEmitter
 from .middleware import ScopeMiddleware
 
@@ -77,6 +78,9 @@ _ble_ingestor: Optional[BLEIngestor] = None
 _serial_ingestor: Optional[SerialIngestor] = None
 _raw_state: Dict[str, Dict[str, Any]] = {}
 _decoder_overrides: Dict[str, Dict[str, Any]] = {}
+_stream_decoders: Dict[str, Any] = {}
+_last_emit: Dict[str, float] = {}
+_ble_stream_threads: Dict[str, threading.Thread] = {}
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -199,6 +203,55 @@ def _decode_config(meta: Dict[str, Any]) -> Dict[str, Any]:
     return {"name": name, "threshold": threshold, "window_samples": window}
 
 
+def _get_decoder(stream_id: str, meta: Dict[str, Any]):
+    cfg = _decoder_overrides.get(stream_id) or _decode_config(meta)
+    decoder = _stream_decoders.get(stream_id)
+    if decoder is None:
+        decoder = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"])
+        _stream_decoders[stream_id] = decoder
+    return decoder, cfg
+
+
+def _should_emit(stream_id: str, magnitude: float, threshold: float) -> bool:
+    now = time.time()
+    last = _last_emit.get(stream_id, 0)
+    if now - last < INTENT_COOLDOWN_SEC:
+        return False
+    if magnitude < threshold:
+        return False
+    _last_emit[stream_id] = now
+    return True
+
+
+def _process_samples(stream_id: str, samples: List[List[float]], meta: Dict[str, Any]) -> None:
+    decoder, cfg = _get_decoder(stream_id, meta)
+    avg_metric, passed = decoder.add_samples(stream_id, samples)
+    # Accumulate raw
+    state = _raw_state.setdefault(
+        stream_id,
+        {
+            "samples": [],
+            "sample_rate": meta.get("sample_rate") or 250,
+            "channel_labels": meta.get("channel_labels") or [],
+            "start_time": time.time(),
+            "sample_index": 0,
+        },
+    )
+    for sample in samples:
+        state["samples"].append(sample)
+        state["sample_index"] += 1
+        if len(state["samples"]) > MAX_BUFFER_SAMPLES:
+            state["samples"] = state["samples"][-MAX_BUFFER_SAMPLES:]
+
+    threshold = cfg.get("threshold", AMPLITUDE_THRESHOLD)
+    if passed and _should_emit(stream_id, avg_metric, threshold):
+        confidence = min(1.0, avg_metric / max(threshold, 1e-3))
+        intent_event = _build_bci_intent("click", confidence=confidence, decoder_name=cfg.get("name", "demo"))
+        intent_event["metadata"]["source_stream"] = stream_id
+        intent_event["intent"]["latency_ms"] = 0
+        asyncio.run(_emit_bci_intent_event(intent_event))
+
+
 def _emit_caps_report() -> None:
     caps = _caps_payload()
     envelope = {
@@ -211,7 +264,7 @@ def _emit_caps_report() -> None:
     logger.info("caps_report", extra={"ok": ok, "status": status, "caps": caps})
 
 
-def _build_bci_intent(command: str, axes: Optional[Dict[str, float]] = None, confidence: float = 0.5) -> Dict[str, Any]:
+def _build_bci_intent(command: str, axes: Optional[Dict[str, float]] = None, confidence: float = 0.5, decoder_name: str = "demo") -> Dict[str, Any]:
     return {
         "schema_version": "2.0",
         "id": str(uuid.uuid4()),
@@ -225,7 +278,7 @@ def _build_bci_intent(command: str, axes: Optional[Dict[str, float]] = None, con
             "mode": "discrete" if axes is None else "continuous",
             "confidence": confidence,
             "latency_ms": 0,
-            "decoder": {"name": "demo", "version": "0.0.1"},
+            "decoder": {"name": decoder_name, "version": "0.0.1"},
         },
         "person": {"id": DEFAULT_PERSON_ID, "session_id": "local-session"},
         "context": {"interaction": "navigation"},
@@ -341,36 +394,7 @@ class LSLIngestor:
                         if not chunk:
                             time.sleep(0.05)
                             continue
-                        decoder = self._decoders.get(stream_id)
-                        if decoder is None:
-                            cfg = _decode_config(meta)
-                            decoder = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"])
-                            self._decoders[stream_id] = decoder
-                        avg_metric, passed = decoder.add_samples(stream_id, chunk)
-                        # Accumulate raw into buffer for /bci/raw mirror/export
-                        state = _raw_state.setdefault(
-                            stream_id,
-                            {
-                                "samples": [],
-                                "sample_rate": sr,
-                                "channel_labels": channel_labels,
-                                "start_time": time.time(),
-                                "sample_index": 0,
-                            },
-                        )
-                        for sample in chunk:
-                            state["samples"].append(sample)
-                            state["sample_index"] += 1
-                            if len(state["samples"]) > MAX_BUFFER_SAMPLES:
-                                state["samples"] = state["samples"][-MAX_BUFFER_SAMPLES:]
-                        cfg = _decode_config(meta)
-                        threshold = cfg.get("threshold", AMPLITUDE_THRESHOLD)
-                        if passed and self._should_emit(stream_id, avg_metric, threshold):
-                            confidence = min(1.0, avg_metric / max(threshold, 1e-3))
-                            intent_event = _build_bci_intent("click", confidence=confidence)
-                            intent_event["metadata"]["source_stream"] = stream_id
-                            intent_event["intent"]["latency_ms"] = 0
-                            asyncio.run(self._emit_cb(intent_event))
+                        _process_samples(stream_id, chunk, meta)
                 except Exception as exc:  # pragma: no cover
                     logger.warning("lsl_ingest_error %s", exc)
                     time.sleep(1)
@@ -411,6 +435,37 @@ def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
         meta = {**meta, **profile}
     devices.attach(device_id, kind, meta)
     log_json(logging.INFO, "device_detected", service=APP_NAME, device_id=device_id, kind=kind)
+    # Start BLE stream if notify UUID provided
+    notify_uuid = meta.get("notify_uuid")
+    parser_name = meta.get("parser")
+    if notify_uuid and parser_name and device_id not in _ble_stream_threads:
+        parser_fn = get_parser(parser_name)
+        if parser_fn:
+            stream = BLEStream(
+                address=meta.get("address") or device_id.replace("ble:", ""),
+                notify_uuid=notify_uuid,
+                sample_rate=meta.get("sample_rate") or 250,
+                channel_count=len(meta.get("channel_labels") or []),
+                parse_fn=parser_fn,
+                on_samples=lambda samples, sid=device_id, m=meta: _process_samples(sid, samples, m),
+            )
+
+            def _runner():
+                asyncio.run(stream.run())
+
+            t = threading.Thread(target=_runner, daemon=True, name=f"ble-stream-{device_id}")
+            _ble_stream_threads[device_id] = t
+            t.start()
+    # Start serial stream if parser/baud provided
+    if device_id.startswith("serial:") and parser_name and meta.get("serial_baud"):
+        parser_fn = get_parser(parser_name)
+        if parser_fn:
+            port = device_id.replace("serial:", "")
+            threading.Thread(
+                target=lambda: _serial_ingestor.stream(port, baudrate=int(meta.get("serial_baud", 115200)), parser=parser_fn),
+                daemon=True,
+                name=f"serial-stream-{port}",
+            ).start()
 
 
 def _start_ble_ingest():

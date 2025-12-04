@@ -23,6 +23,7 @@ Phase 1 MVP scaffold — joins devstack alongside other `unison-io-*` services.
 - `POST /bci/export` — export buffered raw to XDF/EDF (requires `bci.export`; XDF path best effort).
 - Best-effort `caps.report` emission on startup (`bci_adapter: {present: true}`).
 - Best-effort BLE scan and serial probe to detect known EEG devices; LSL ingest for EEG streams.
+- BLE streaming stubs (e.g., Muse-S notify UUID + simple parser) and serial CSV streaming hooks (e.g., OpenBCI serial) feed samples into the decoder pipeline.
 - Optional virtual HID output using `evdev/uinput` when available; otherwise logs.
 
 ## Running locally
