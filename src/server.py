@@ -44,6 +44,7 @@ INTENT_COOLDOWN_SEC = float(os.getenv("UNISON_BCI_INTENT_COOLDOWN_SEC", "3.0"))
 WINDOW_SAMPLES = int(os.getenv("UNISON_BCI_WINDOW_SAMPLES", "50"))
 MAX_BUFFER_SAMPLES = int(os.getenv("UNISON_BCI_MAX_BUFFER_SAMPLES", "5000"))
 DEFAULT_DECODER_NAME = os.getenv("UNISON_BCI_DECODER", "window")
+MAX_RAW_SNAPSHOT = int(os.getenv("UNISON_BCI_MAX_RAW_SNAPSHOT", "200"))
 REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subscribe")
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
@@ -627,6 +628,12 @@ async def websocket_raw(ws: WebSocket):
         await ws.close(code=4403)
         return
     await ws.accept()
+    limit_param = ws.query_params.get("limit")
+    try:
+        limit = int(limit_param) if limit_param else 100
+    except Exception:
+        limit = 100
+    limit = max(1, min(limit, MAX_RAW_SNAPSHOT))
     try:
         while True:
             # Stream snapshot of raw buffers (trimmed) and then sleep briefly
@@ -638,7 +645,7 @@ async def websocket_raw(ws: WebSocket):
                 samples = state.get("samples", [])
                 payload["streams"][sid] = {
                     "count": len(samples),
-                    "samples": samples[-100:],  # keep payload small
+                    "samples": samples[-limit:],  # keep payload small
                     "sample_rate": state.get("sample_rate"),
                     "channel_labels": state.get("channel_labels") or [],
                 }

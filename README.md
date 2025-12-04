@@ -18,7 +18,7 @@ Phase 1 MVP scaffold — joins devstack alongside other `unison-io-*` services.
 - `GET /bci/decoders` — list available decoders and defaults.
 - `GET /bci/devices` — list attached streams.
 - `WS /bci/intents` — subscribe to decoded intents (requires `bci.intent.subscribe` scope; push-only).
-- `WS /bci/raw` — diagnostics/raw mirror (requires `bci.raw.read`).
+- `WS /bci/raw` — diagnostics/raw mirror (requires `bci.raw.read`); supports `?stream=<id>` and `?limit=<n>` (default 100, capped by `UNISON_BCI_MAX_RAW_SNAPSHOT`).
 - `POST /bci/hid-map` — configure BCI→virtual HID mappings (requires `bci.hid.map`).
 - `POST /bci/export` — export buffered raw to XDF/EDF (requires `bci.export`; XDF path best effort).
 - Best-effort `caps.report` emission on startup (`bci_adapter: {present: true}`).
@@ -47,6 +47,7 @@ Environment:
 - `UNISON_BCI_CONSENT_INTROSPECT_URL` — optional consent introspection endpoint (e.g., consent `/introspect`).
 - `UNISON_BCI_SCOPE_EXPORT` — scope required for export endpoints (default `bci.export`).
 - `UNISON_BCI_MAX_BUFFER_SAMPLES` — max samples retained per stream for raw mirror/export.
+- `UNISON_BCI_MAX_RAW_SNAPSHOT` — cap for samples returned per stream in raw snapshots.
 
 ## Repo layout
 - `src/` — FastAPI service, LSL discovery stub, demo intent emitter, WS endpoints.
