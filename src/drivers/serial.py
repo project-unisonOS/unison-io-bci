@@ -11,7 +11,7 @@ logger = logging.getLogger("unison-io-bci.serial")
 
 
 class SerialIngestor:
-    """Placeholder serial/USB ingestor for EEG bridges."""
+    """Serial/USB ingestor for EEG bridges (OpenBCI-style CSV)."""
 
     def __init__(self, on_detect, on_samples=None) -> None:
         self._on_detect = on_detect
@@ -30,7 +30,7 @@ class SerialIngestor:
             meta: Dict[str, Any] = {"device": port.device, "description": port.description}
             self._on_detect(f"serial:{port.device}", "eeg", meta)
 
-    def stream(self, port: str, baudrate: int = 115200, parser=None):
+    def stream(self, port: str, baudrate: int = 115200, parser=None, meta: Dict[str, Any] | None = None):
         if not _SERIAL_AVAILABLE:
             logger.info("pyserial_not_available; skipping serial stream")
             return
@@ -48,7 +48,7 @@ class SerialIngestor:
                 try:
                     samples = parser(line) if parser else None
                     if samples and self._on_samples:
-                        self._on_samples(samples)
+                        self._on_samples(samples, meta or {})
                 except Exception as exc:  # pragma: no cover
                     logger.warning("serial_parse_error %s", exc)
         except Exception as exc:

@@ -46,3 +46,12 @@ class HIDEmitter:
             except Exception as exc:  # pragma: no cover
                 logger.warning("hid_send_failed %s", exc)
         logger.info("hid_event_logged %s", keycode)
+
+
+def is_valid_keycode(keycode: str) -> bool:
+    """Validate keycodes against evdev when available."""
+    if not keycode:
+        return False
+    if not _EVDEV_AVAILABLE:
+        return True
+    return hasattr(e, keycode)

@@ -15,7 +15,7 @@ class AllowAuth:
 
 def test_intents_ws_allows_with_scope(monkeypatch):
     client = TestClient(app)
-    server._auth = AllowAuth()  # type: ignore
+    server.set_auth(AllowAuth())  # type: ignore
     with client.websocket_connect("/bci/intents?token=tok") as ws:
         ws.send_text("ping")  # ignored but keeps socket alive
         # Should stay open; close manually
@@ -25,7 +25,7 @@ def test_intents_ws_allows_with_scope(monkeypatch):
 
 def test_export_allows_with_scope(monkeypatch):
     client = TestClient(app)
-    server._auth = AllowAuth()  # type: ignore
+    server.set_auth(AllowAuth())  # type: ignore
     server._raw_state["demo"] = {
         "samples": [[0.1, 0.2], [0.3, 0.4]],
         "sample_rate": 250,

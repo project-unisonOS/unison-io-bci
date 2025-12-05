@@ -26,14 +26,14 @@ class DenyAuth:
 
 
 def test_middleware_allows_and_sets_claims(monkeypatch):
-    server._auth = AllowAuth()  # type: ignore
+    server.set_auth(AllowAuth())  # type: ignore
     client = TestClient(app)
     r = client.get("/health", headers={"Authorization": "Bearer tok"})
     assert r.status_code == 200
 
 
 def test_middleware_blocks_invalid_token(monkeypatch):
-    server._auth = DenyAuth()  # type: ignore
+    server.set_auth(DenyAuth())  # type: ignore
     client = TestClient(app)
     r = client.get("/health", headers={"Authorization": "Bearer tok"})
     assert r.status_code == 403

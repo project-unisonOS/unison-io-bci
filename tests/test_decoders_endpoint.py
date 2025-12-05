@@ -10,3 +10,5 @@ def test_decoders_endpoint_lists_defaults():
     data = resp.json()
     assert "decoders" in data
     assert any(d.get("name") == "window" for d in data["decoders"])
+    assert any(d.get("name") == "bandpower" for d in data["decoders"])
+    assert any(d.get("name") == "ssvep" for d in data["decoders"])

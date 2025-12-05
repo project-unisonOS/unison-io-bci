@@ -1,11 +1,13 @@
 import asyncio
 import json
+import gzip
 import logging
 import os
 import threading
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
@@ -20,7 +22,7 @@ from .drivers.ble import BLEIngestor
 from .drivers.ble_stream import BLEStream
 from .drivers.serial import SerialIngestor
 from .drivers.registry import get_profile, get_parser
-from .hid import HIDEmitter
+from .hid import HIDEmitter, is_valid_keycode, _EVDEV_AVAILABLE
 from .middleware import ScopeMiddleware
 
 try:
@@ -53,17 +55,16 @@ REQUIRED_SCOPE_INTENTS = os.getenv("UNISON_BCI_SCOPE_INTENTS", "bci.intent.subsc
 REQUIRED_SCOPE_RAW = os.getenv("UNISON_BCI_SCOPE_RAW", "bci.raw.read")
 REQUIRED_SCOPE_HID = os.getenv("UNISON_BCI_SCOPE_HID", "bci.hid.map")
 REQUIRED_SCOPE_EXPORT = os.getenv("UNISON_BCI_SCOPE_EXPORT", "bci.export")
+MAX_EXPORT_SECONDS = float(os.getenv("UNISON_BCI_MAX_EXPORT_SECONDS", "600"))
 AUTH_JWKS_URL = os.getenv("UNISON_BCI_AUTH_JWKS_URL", "")
 AUTH_AUDIENCE = os.getenv("UNISON_BCI_AUTH_AUDIENCE", "")
 AUTH_ISSUER = os.getenv("UNISON_BCI_AUTH_ISSUER", "")
 CONSENT_INTROSPECT_URL = os.getenv("UNISON_BCI_CONSENT_INTROSPECT_URL", "")
+CONTEXT_HOST = os.getenv("UNISON_CONTEXT_HOST", "context")
+CONTEXT_PORT = os.getenv("UNISON_CONTEXT_PORT", "8082")
+CONTEXT_SCHEME = os.getenv("UNISON_CONTEXT_SCHEME", "http")
 
 logger = configure_logging(APP_NAME) if "configure_logging" in globals() else logging.getLogger(APP_NAME)
-app = FastAPI(title=APP_NAME)
-if BatonMiddleware:
-    app.add_middleware(BatonMiddleware)
-app.add_middleware(ScopeMiddleware, auth=_auth)
-
 _metrics = defaultdict(int)
 _start_time = time.time()
 _hid_mappings: Dict[str, str] = {}
@@ -74,6 +75,12 @@ _auth = AuthValidator(
     issuer=AUTH_ISSUER or None,
     consent_introspect_url=CONSENT_INTROSPECT_URL or None,
 )
+
+app = FastAPI(title=APP_NAME)
+if BatonMiddleware:
+    app.add_middleware(BatonMiddleware)
+app.add_middleware(ScopeMiddleware, auth=_auth)
+app.state.auth = _auth
 _ble_ingestor: Optional[BLEIngestor] = None
 _serial_ingestor: Optional[SerialIngestor] = None
 _raw_state: Dict[str, Dict[str, Any]] = {}
@@ -81,6 +88,26 @@ _decoder_overrides: Dict[str, Dict[str, Any]] = {}
 _stream_decoders: Dict[str, Any] = {}
 _last_emit: Dict[str, float] = {}
 _ble_stream_threads: Dict[str, threading.Thread] = {}
+
+
+def set_auth(auth: AuthValidator) -> None:
+    """Update the auth validator for tests or hot-reload."""
+    global _auth
+    _auth = auth
+    app.state.auth = auth
+
+
+def _person_decoder_config(person_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not person_id:
+        return None
+    ok, status, data = http_get_json(CONTEXT_HOST, CONTEXT_PORT, f"/profile/{person_id}")
+    if not ok or not isinstance(data, dict):
+        return None
+    bci = data.get("bci") or {}
+    decoder_cfg = bci.get("decoder")
+    if isinstance(decoder_cfg, dict):
+        return decoder_cfg
+    return None
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -101,6 +128,27 @@ def http_post_json(host: str, port: str, path: str, payload: dict, headers: Dict
             merged_headers.update(headers)
         with httpx.Client(timeout=2.0) as client:
             resp = client.post(url, json=payload, headers=merged_headers)
+        parsed = None
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+        return (resp.status_code >= 200 and resp.status_code < 300, resp.status_code, parsed)
+    except Exception:
+        return (False, 0, None)
+
+
+def http_get_json(host: str, port: str, path: str, headers: Dict[str, str] | None = None) -> tuple[bool, int, dict | None]:
+    try:
+        url = f"http://{host}:{port}{path}"
+        merged_headers = {"Accept": "application/json"}
+        baton = get_current_baton() if "get_current_baton" in globals() else None
+        if baton:
+            merged_headers["X-Context-Baton"] = baton
+        if headers:
+            merged_headers.update(headers)
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(url, headers=merged_headers)
         parsed = None
         try:
             parsed = resp.json()
@@ -172,6 +220,7 @@ def _require_scope_request(request: Request, required: str | None):
         return
     token = _auth.extract_token(request.headers.get("Authorization"))
     if not token or not _auth.authorize(token, required):
+        _metrics["scope_denied"] += 1
         raise HTTPException(status_code=403, detail=f"missing required scope: {required}")
 
 
@@ -179,7 +228,10 @@ def _require_scope_ws(ws: WebSocket, required: str | None) -> bool:
     if not required:
         return True
     token = _auth.extract_token(ws.headers.get("Authorization"), ws.query_params.get("token"))
-    return bool(token and _auth.authorize(token, required))
+    allowed = bool(token and _auth.authorize(token, required))
+    if not allowed:
+        _metrics["ws_scope_denied"] += 1
+    return allowed
 
 
 def require_scope_dep(required: str):
@@ -200,14 +252,17 @@ def _decode_config(meta: Dict[str, Any]) -> Dict[str, Any]:
     name = str(decoder_cfg.get("name") or DEFAULT_DECODER_NAME)
     threshold = float(decoder_cfg.get("threshold", AMPLITUDE_THRESHOLD))
     window = int(decoder_cfg.get("window_samples", WINDOW_SAMPLES))
-    return {"name": name, "threshold": threshold, "window_samples": window}
+    band = decoder_cfg.get("band") or decoder_cfg.get("bands")
+    targets = decoder_cfg.get("targets")
+    sample_rate = decoder_cfg.get("sample_rate") or meta.get("sample_rate") or 250
+    return {"name": name, "threshold": threshold, "window_samples": window, "band": band, "targets": targets, "sample_rate": sample_rate}
 
 
 def _get_decoder(stream_id: str, meta: Dict[str, Any]):
     cfg = _decoder_overrides.get(stream_id) or _decode_config(meta)
     decoder = _stream_decoders.get(stream_id)
     if decoder is None:
-        decoder = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"])
+        decoder = make_decoder(cfg["name"], cfg["window_samples"], cfg["threshold"], sample_rate=cfg.get("sample_rate"), params=cfg)
         _stream_decoders[stream_id] = decoder
     return decoder, cfg
 
@@ -224,7 +279,10 @@ def _should_emit(stream_id: str, magnitude: float, threshold: float) -> bool:
 
 
 def _process_samples(stream_id: str, samples: List[List[float]], meta: Dict[str, Any]) -> None:
+    start = time.time()
     decoder, cfg = _get_decoder(stream_id, meta)
+    _metrics["raw_samples_ingested"] += len(samples)
+    _metrics["decoder_eval"] += 1
     avg_metric, passed = decoder.add_samples(stream_id, samples)
     # Accumulate raw
     state = _raw_state.setdefault(
@@ -241,6 +299,8 @@ def _process_samples(stream_id: str, samples: List[List[float]], meta: Dict[str,
         state["samples"].append(sample)
         state["sample_index"] += 1
         if len(state["samples"]) > MAX_BUFFER_SAMPLES:
+            dropped = len(state["samples"]) - MAX_BUFFER_SAMPLES
+            _metrics["raw_samples_dropped"] += max(dropped, 0)
             state["samples"] = state["samples"][-MAX_BUFFER_SAMPLES:]
 
     threshold = cfg.get("threshold", AMPLITUDE_THRESHOLD)
@@ -249,7 +309,13 @@ def _process_samples(stream_id: str, samples: List[List[float]], meta: Dict[str,
         intent_event = _build_bci_intent("click", confidence=confidence, decoder_name=cfg.get("name", "demo"))
         intent_event["metadata"]["source_stream"] = stream_id
         intent_event["intent"]["latency_ms"] = 0
+        _metrics["decoder_pass"] += 1
+        log_json(logging.INFO, "decoder_pass", service=APP_NAME, stream_id=stream_id, decoder=cfg.get("name"), metric=avg_metric)
         asyncio.run(_emit_bci_intent_event(intent_event))
+    # Metrics for ingest latency
+    elapsed_ms = (time.time() - start) * 1000.0
+    _metrics["ingest_latency_samples"] += 1
+    _metrics["ingest_latency_ms_total"] += elapsed_ms
 
 
 def _emit_caps_report() -> None:
@@ -318,6 +384,29 @@ def _emit_hid_mapping_if_any(intent_event: Dict[str, Any]) -> None:
             "auth_scope": "bci.hid.map",
         }
         http_post_json(ORCH_HOST, ORCH_PORT, "/event", hid_event)
+
+
+def _write_xdf(filename: str, streams: List[Dict[str, Any]]) -> None:
+    """
+    Persist a minimal XDF-like structure.
+    Falls back to JSON when pyxdf does not expose save_xdf (WSL/CI friendliness).
+    """
+    try:
+        import pyxdf  # type: ignore
+
+        save_fn = getattr(pyxdf, "save_xdf", None)
+    except Exception:
+        save_fn = None
+    if save_fn:
+        save_fn(filename, streams)  # type: ignore[misc]
+        return
+    payload = {
+        "schema": "unison-xdf-lite",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "streams": streams,
+    }
+    with open(filename, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
 
 
 class LSLIngestor:
@@ -462,7 +551,12 @@ def _on_device_detect(device_id: str, kind: str, meta: Dict[str, Any]) -> None:
         if parser_fn:
             port = device_id.replace("serial:", "")
             threading.Thread(
-                target=lambda: _serial_ingestor.stream(port, baudrate=int(meta.get("serial_baud", 115200)), parser=parser_fn),
+                target=lambda: _serial_ingestor.stream(
+                    port,
+                    baudrate=int(meta.get("serial_baud", 115200)),
+                    parser=parser_fn,
+                    meta=meta,
+                ),
                 daemon=True,
                 name=f"serial-stream-{port}",
             ).start()
@@ -481,21 +575,42 @@ def _start_ble_ingest():
 
 def _start_serial_probe():
     global _serial_ingestor
-    _serial_ingestor = SerialIngestor(_on_device_detect)
+    _serial_ingestor = SerialIngestor(_on_device_detect, on_samples=_process_samples)
     t = threading.Thread(target=_serial_ingestor.probe, daemon=True, name="bci-serial-probe")
     t.start()
 
 
-@app.on_event("startup")
-def _on_startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     try:
-        _emit_caps_report()
-    except Exception as exc:  # pragma: no cover
-        logger.warning("caps_report_failed %s", exc)
-    _start_demo_if_enabled()
-    _start_lsl_ingest()
-    _start_ble_ingest()
-    _start_serial_probe()
+        try:
+            _emit_caps_report()
+        except Exception as exc:  # pragma: no cover
+            logger.warning("caps_report_failed %s", exc)
+        _start_demo_if_enabled()
+        _start_lsl_ingest()
+        _start_ble_ingest()
+        _start_serial_probe()
+        yield
+    finally:
+        try:
+            if _lsl_ingestor:
+                _lsl_ingestor.stop()
+        except Exception:
+            pass
+        try:
+            if _ble_ingestor:
+                _ble_ingestor.stop()
+        except Exception:
+            pass
+        try:
+            if _serial_ingestor:
+                pass
+        except Exception:
+            pass
+
+
+app.router.lifespan_context = lifespan
 
 
 @app.get("/healthz")
@@ -544,10 +659,13 @@ def attach_device(payload: Dict[str, Any] = Body(...), _: bool = Depends(require
     meta = payload.get("meta", {})
     if not isinstance(meta, dict):
         raise HTTPException(status_code=400, detail="meta must be an object")
-    decoder_cfg = _decode_config({"decoder": payload.get("decoder", {})})
+    person_id = payload.get("person_id")
+    decoder_cfg = payload.get("decoder") or _person_decoder_config(person_id) or {}
+    decoder_cfg = _decode_config({**meta, "decoder": decoder_cfg})
     meta["decoder"] = decoder_cfg
-    if payload.get("person_id"):
-        meta["person_id"] = payload.get("person_id")
+    if person_id:
+        meta["person_id"] = person_id
+        _decoder_overrides[device_id] = decoder_cfg
     record = devices.attach(device_id, kind, meta)
     log_json(logging.INFO, "bci_device_attached", service=APP_NAME, device_id=device_id, kind=kind)
     return {"ok": True, "device": record}
@@ -571,14 +689,20 @@ def set_hid_map(request: Request, payload: Dict[str, Any] = Body(...), _: bool =
     mappings = payload.get("mappings")
     if not isinstance(mappings, dict):
         raise HTTPException(status_code=400, detail="mappings must be an object")
+    for key, val in mappings.items():
+        if not is_valid_keycode(str(val)):
+            raise HTTPException(status_code=400, detail=f"invalid keycode: {val}")
     _hid_mappings.clear()
     _hid_mappings.update({str(k): str(v) for k, v in mappings.items()})
+    person_id = payload.get("person_id") or DEFAULT_PERSON_ID
+    if person_id and CONTEXT_HOST:
+        http_post_json(CONTEXT_HOST, CONTEXT_PORT, f"/profile/{person_id}", {"bci": {"hid_mappings": _hid_mappings}})
     log_json(logging.INFO, "hid_map_updated", service=APP_NAME, mappings=list(_hid_mappings.keys()))
     return {"ok": True, "mappings": _hid_mappings}
 
 
 @app.post("/bci/export")
-def export_raw(request: Request, format: str = Body(..., embed=True, default="xdf"), _: bool = Depends(require_scope_dep(REQUIRED_SCOPE_EXPORT))):
+def export_raw(request: Request, format: str = Body(default="xdf", embed=True), _: bool = Depends(require_scope_dep(REQUIRED_SCOPE_EXPORT))):
     fmt = format.lower()
     if fmt not in {"xdf", "edf"}:
         raise HTTPException(status_code=400, detail="unsupported format; use xdf or edf")
@@ -586,8 +710,7 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
     try:
         if fmt == "xdf":
             # Minimal XDF with one stream containing concatenated samples
-            import pyxdf  # type: ignore
-            streams = []
+            streams: List[Dict[str, Any]] = []
             for sid, state in _raw_state.items():
                 samples = state.get("samples", [])
                 if not samples:
@@ -604,24 +727,30 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                 )
             if not streams:
                 raise HTTPException(status_code=400, detail="no samples available to export")
-            pyxdf.save_xdf(filename, streams)
+            max_duration = max(
+                (len(state.get("samples", [])) / max(state.get("sample_rate") or 250, 1) for state in _raw_state.values() if state.get("samples")),
+                default=0,
+            )
+            if max_duration > MAX_EXPORT_SECONDS:
+                raise HTTPException(status_code=400, detail="export exceeds max duration")
+            _write_xdf(filename, streams)
         else:
             import pyedflib  # type: ignore
+            import numpy as np  # type: ignore
 
             # Flatten buffers into signals; pad/truncate to same length
             max_len = max((len(state.get("samples", [])) for state in _raw_state.values()), default=0)
             if max_len == 0:
                 raise HTTPException(status_code=400, detail="no samples available to export")
-            channel_names = []
-            signals = []
-            sample_rates = []
+            channel_names: List[str] = []
+            signals: List[List[float]] = []
+            signal_rates: List[float] = []
             for sid, state in _raw_state.items():
                 samples = state.get("samples", [])
                 if not samples:
                     continue
                 sr = state.get("sample_rate") or 250
                 labels = state.get("channel_labels") or []
-                sample_rates.append(sr)
                 if labels:
                     channel_names.extend(labels)
                     # transpose channel-major
@@ -631,6 +760,7 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                         if len(sig) < max_len:
                             sig.extend([0.0] * (max_len - len(sig)))
                         signals.append(sig)
+                        signal_rates.append(sr)
                 else:
                     channel_names.append(sid)
                     flattened = [sum(s) / max(len(s), 1) for s in samples]
@@ -639,16 +769,27 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                     else:
                         flattened = flattened[:max_len]
                     signals.append(flattened)
+                    signal_rates.append(sr)
 
             n_channels = len(signals)
-            f = pyedflib.EdfWriter(filename, n_channels=n_channels)
+            if n_channels == 0:
+                raise HTTPException(status_code=400, detail="no samples available to export")
+            approx_duration = max_len / max(max(signal_rates, default=250), 1)
+            if approx_duration > MAX_EXPORT_SECONDS:
+                raise HTTPException(status_code=400, detail="export exceeds max duration")
+            f = pyedflib.EdfWriter(filename, n_channels=n_channels, file_type=pyedflib.FILETYPE_EDFPLUS)
+            try:
+                start_ts = min((state.get("start_time") or time.time() for state in _raw_state.values()), default=time.time())
+                f.setStartdatetime(datetime.fromtimestamp(start_ts, tz=timezone.utc))
+            except Exception:
+                pass
             channel_info = []
-            for name in channel_names:
+            for name, rate in zip(channel_names, signal_rates):
                 channel_info.append(
                     {
                         "label": name[:16],
                         "dimension": "uV",
-                        "sample_rate": sample_rates[0] if sample_rates else 250,
+                        "sample_frequency": rate,
                         "physical_min": -1000,
                         "physical_max": 1000,
                         "digital_min": -32768,
@@ -658,7 +799,7 @@ def export_raw(request: Request, format: str = Body(..., embed=True, default="xd
                     }
                 )
             f.setSignalHeaders(channel_info)
-            f.writeSamples(signals)
+            f.writeSamples([np.asarray(sig, dtype=float) for sig in signals])
             f.close()
         return {"ok": True, "file": filename}
     except Exception as exc:
@@ -688,7 +829,7 @@ async def websocket_intents(ws: WebSocket):
 async def websocket_raw(ws: WebSocket):
     if not _require_scope_ws(ws, REQUIRED_SCOPE_RAW):
         await ws.close(code=4403)
-        return
+        raise WebSocketDisconnect(code=4403)
     await ws.accept()
     limit_param = ws.query_params.get("limit")
     try:
@@ -696,6 +837,8 @@ async def websocket_raw(ws: WebSocket):
     except Exception:
         limit = 100
     limit = max(1, min(limit, MAX_RAW_SNAPSHOT))
+    compress = (ws.query_params.get("compress") or "").lower() in {"1", "true", "yes", "on", "gzip"}
+    use_cbor = (ws.query_params.get("format") or "").lower() == "cbor"
     try:
         while True:
             # Stream snapshot of raw buffers (trimmed) and then sleep briefly
@@ -711,7 +854,34 @@ async def websocket_raw(ws: WebSocket):
                     "sample_rate": state.get("sample_rate"),
                     "channel_labels": state.get("channel_labels") or [],
                 }
-            await ws.send_json(payload)
+            _metrics["raw_snapshot_sent"] += 1
+            try:
+                data_bytes = None
+                encoding = "json"
+                if use_cbor:
+                    try:
+                        import cbor2  # type: ignore
+                        data_bytes = cbor2.dumps(payload)
+                        encoding = "cbor"
+                    except Exception:
+                        data_bytes = None
+                        encoding = "json"
+                if data_bytes is None:
+                    data_bytes = json.dumps(payload).encode()
+                    encoding = "json"
+                if compress:
+                    compressed = gzip.compress(data_bytes)
+                    _metrics["raw_snapshot_bytes"] += len(compressed)
+                    await ws.send_bytes(compressed)
+                elif encoding == "cbor":
+                    _metrics["raw_snapshot_bytes"] += len(data_bytes)
+                    await ws.send_bytes(data_bytes)
+                else:
+                    _metrics["raw_snapshot_bytes"] += len(data_bytes)
+                    await ws.send_json(payload)
+            except Exception:
+                await ws.close()
+                return
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:
         return
