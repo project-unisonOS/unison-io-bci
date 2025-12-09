@@ -4,7 +4,8 @@ FROM python:3.12-slim
 ARG REPO_PATH="unison-io-bci"
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends curl git ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl git ca-certificates build-essential linux-libc-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY ${REPO_PATH}/constraints.txt ./constraints.txt
