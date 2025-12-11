@@ -1,0 +1,20 @@
+name: Publish container
+
+on:
+  push:
+    branches: [ main, "release/**" ]
+    tags: [ "v*" ]
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  publish:
+    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@main
+    with:
+      image_name: unison-io-bci
+      domain: io-bci
+      service_port: "8080"
+    secrets: inherit
