@@ -16,5 +16,5 @@ jobs:
     with:
       image_name: unison-io-bci
       domain: io-bci
-      service_port: "8080"
+      service_port: "8089"
     secrets: inherit
