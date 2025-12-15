@@ -120,12 +120,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
 def http_post_json(host: str, port: str, path: str, payload: dict, headers: Dict[str, str] | None = None) -> tuple[bool, int, dict | None]:
     try:
         url = f"http://{host}:{port}{path}"
-        merged_headers = {"Accept": "application/json"}
+        merged_headers: Dict[str, Any] = {"Accept": "application/json"}
         baton = get_current_baton() if "get_current_baton" in globals() else None
         if baton:
             merged_headers["X-Context-Baton"] = baton
         if headers:
             merged_headers.update(headers)
+        merged_headers = {k: str(v) for k, v in merged_headers.items() if v is not None}
         with httpx.Client(timeout=2.0) as client:
             resp = client.post(url, json=payload, headers=merged_headers)
         parsed = None
@@ -141,12 +142,13 @@ def http_post_json(host: str, port: str, path: str, payload: dict, headers: Dict
 def http_get_json(host: str, port: str, path: str, headers: Dict[str, str] | None = None) -> tuple[bool, int, dict | None]:
     try:
         url = f"http://{host}:{port}{path}"
-        merged_headers = {"Accept": "application/json"}
+        merged_headers: Dict[str, Any] = {"Accept": "application/json"}
         baton = get_current_baton() if "get_current_baton" in globals() else None
         if baton:
             merged_headers["X-Context-Baton"] = baton
         if headers:
             merged_headers.update(headers)
+        merged_headers = {k: str(v) for k, v in merged_headers.items() if v is not None}
         with httpx.Client(timeout=2.0) as client:
             resp = client.get(url, headers=merged_headers)
         parsed = None
@@ -628,7 +630,8 @@ def ready(request: Request):
     _metrics["/ready"] += 1
     event_id = request.headers.get("X-Event-ID")
     _require_scope_request(request, REQUIRED_SCOPE_INTENTS)
-    ok, _, _ = http_post_json(ORCH_HOST, ORCH_PORT, "/health", {}, headers={"X-Event-ID": event_id})
+    headers = {"X-Event-ID": event_id} if event_id else None
+    ok, _, _ = http_get_json(ORCH_HOST, ORCH_PORT, "/health", headers=headers)
     log_json(logging.INFO, "ready", service=APP_NAME, event_id=event_id, orchestrator_ok=ok)
     return {"ready": ok, "orchestrator": {"host": ORCH_HOST, "port": ORCH_PORT, "ok": ok}}
 
