@@ -9,10 +9,12 @@ permissions:
   contents: read
   packages: write
   id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   publish:
-    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@main
+    uses: project-unisonOS/unison-platform/.github/workflows/reusable-build.yml@ee1593dae7c003651890e66918aed47cb03db06d
     with:
       image_name: unison-io-bci
       domain: io-bci
