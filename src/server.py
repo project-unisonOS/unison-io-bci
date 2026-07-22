@@ -35,8 +35,17 @@ try:
     from unison_common.logging import configure_logging, log_json
     from unison_common.baton import get_current_baton
     from unison_common import BatonMiddleware
-except Exception:  # pragma: no cover - fallback if unison_common not present
+except (ImportError, ModuleNotFoundError):  # pragma: no cover - standalone fallback
     BatonMiddleware = None
+
+    def log_json(level: int, event: str, **fields: Any) -> None:
+        """Preserve structured log calls when unison-common is unavailable."""
+        logging.getLogger("unison-io-bci").log(
+            level,
+            "%s %s",
+            event,
+            json.dumps(fields, sort_keys=True, default=str),
+        )
 
 APP_NAME = "unison-io-bci"
 ORCH_HOST = os.getenv("UNISON_ORCH_HOST", "orchestrator")
